@@ -85,9 +85,9 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements-dev.txt
 
-      # `ai-maintainer` carries no extension, and ruff finds files by extension,
-      # so a bare `.` would walk past it. `extend-include` in ruff.toml names it
-      # instead, which keeps a local run over the same files as this one.
+      # Both sources carry a .py extension, so a bare `.` finds them and
+      # ruff.toml needs no `extend-include`. Settings live in that file rather
+      # than on the command line, so a local run covers what this one does.
       - name: Run ruff check
         run: ruff check .
 

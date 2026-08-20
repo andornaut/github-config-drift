@@ -3,11 +3,6 @@
 # default, and reflowing them buys nothing.
 line-length = 120
 
-# The CLI itself carries no .py extension, and ruff finds files by extension.
-# Named here rather than on the command line, so `ruff check .` covers the same
-# files locally as the gate does.
-extend-include = ["ai-maintainer"]
-
 # The floor the README states, and the version .python-version pins, which is
 # the only one the gate runs. A floor below that is a claim nothing checks:
 # ruff holds the syntax it knows about to the target, but a stdlib call added
