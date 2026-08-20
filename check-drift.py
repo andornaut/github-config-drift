@@ -77,9 +77,16 @@ class GhError(RuntimeError):
 MISSING = "HTTP 404"
 ATTEMPTS = 3
 
+# One run is one snapshot, and several files are asked for twice: the languages
+# endpoint once per language, and a workflow once for its own comparison and
+# again when the steps are read out of it. Answering the repeat from here keeps
+# the run well under the token's hourly ceiling, which matters now that a call
+# that cannot be completed ends the sweep rather than shrinking it.
+_ANSWERED = {}
+
 
 def gh(*args, allow_missing=False):
-    """Run gh and return stdout.
+    """Run gh and return stdout, reusing an answer already given in this run.
 
     Raises GhError when the call cannot be completed, so a failure stops the
     sweep rather than reducing what it covers. Returns None only when
@@ -90,6 +97,9 @@ def gh(*args, allow_missing=False):
     worth surviving here are transient, and one unattended run makes several
     hundred calls on a token that is rate limited.
     """
+    key = (args, allow_missing)
+    if key in _ANSWERED:
+        return _ANSWERED[key]
     for attempt in range(ATTEMPTS):
         result = subprocess.run(  # noqa: S603
             ["gh", *args],  # noqa: S607
@@ -98,9 +108,11 @@ def gh(*args, allow_missing=False):
             check=False,
         )
         if result.returncode == 0:
+            _ANSWERED[key] = result.stdout
             return result.stdout
         if MISSING in result.stderr:
             if allow_missing:
+                _ANSWERED[key] = None
                 return None
             raise GhError(f"gh {' '.join(args)}: {result.stderr.strip()}")
         if attempt < ATTEMPTS - 1:

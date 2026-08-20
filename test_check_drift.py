@@ -8,6 +8,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
+
 module_path = Path(__file__).parent / "check-drift.py"
 loader = importlib.machinery.SourceFileLoader("check_drift", str(module_path))
 spec = importlib.util.spec_from_loader("check_drift", loader)
@@ -58,6 +60,12 @@ class TestDroppedIgnores:
             "CLAUDE.md",
             "GEMINI.md",
         ]
+
+
+@pytest.fixture(autouse=True)
+def _forget_answers():
+    """gh() reuses an answer for the life of a run, and each test is its own run."""
+    cd._ANSWERED.clear()
 
 
 class StubResult:
