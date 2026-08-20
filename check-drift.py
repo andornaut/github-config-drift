@@ -10,7 +10,10 @@ behind, and it can also be ahead, having reached a stricter position on its own,
 which is worth adopting rather than reverting. Deciding which is which needs the
 diff, so the diff is what this prints.
 
-Exits 1 when anything has drifted, 0 when nothing has.
+Exits 1 when anything has drifted, 0 when nothing has, and 2 when the sweep
+could not be completed. That third state exists because a query that failed and
+a gate nobody added both read as absence otherwise, and only one of them is an
+answer.
 """
 
 import argparse
@@ -19,6 +22,7 @@ import difflib
 import json
 import subprocess
 import sys
+import time
 import tomllib
 from pathlib import Path
 
@@ -60,15 +64,48 @@ SHELL_EXEMPT = {
 }
 
 
-def gh(*args):
-    """Run gh and return stdout, or None when it fails (a missing file, usually)."""
-    result = subprocess.run(  # noqa: S603
-        ["gh", *args],  # noqa: S607
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return result.stdout if result.returncode == 0 else None
+class GhError(RuntimeError):
+    """A gh call that could not be completed, as opposed to one that found nothing."""
+
+
+# gh exits non-zero both for a file a repository does not carry and for a call
+# that never reached an answer. Only the first is a result. Reading the second as
+# absence is what turns a rate-limited sweep green: `holds_language` reports the
+# language missing, and the check that would have named an unconfigured gate is
+# skipped. 404 is the missing-file case; everything else is retried and then
+# raised.
+MISSING = "HTTP 404"
+ATTEMPTS = 3
+
+
+def gh(*args, allow_missing=False):
+    """Run gh and return stdout.
+
+    Raises GhError when the call cannot be completed, so a failure stops the
+    sweep rather than reducing what it covers. Returns None only when
+    allow_missing is set and the API answered 404, which is a repository that
+    does not carry the file rather than a query that did not arrive.
+
+    A 404 is not retried: it is the answer. Anything else is, since the failures
+    worth surviving here are transient, and one unattended run makes several
+    hundred calls on a token that is rate limited.
+    """
+    for attempt in range(ATTEMPTS):
+        result = subprocess.run(  # noqa: S603
+            ["gh", *args],  # noqa: S607
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            return result.stdout
+        if MISSING in result.stderr:
+            if allow_missing:
+                return None
+            raise GhError(f"gh {' '.join(args)}: {result.stderr.strip()}")
+        if attempt < ATTEMPTS - 1:
+            time.sleep(2**attempt)
+    raise GhError(f"gh {' '.join(args)}: {result.stderr.strip()}")
 
 
 def repositories():
@@ -85,14 +122,19 @@ def repositories():
         "--jq",
         ".[] | select(.archived==false and .fork==false) | .name",
     )
-    if out is None:
-        sys.exit("cannot list repositories: is gh authenticated?")
-    return sorted(out.split())
+    names = sorted(out.split())
+    # An empty listing is not an estate with nothing in it: this repository is
+    # itself one of the results, so zero means the query answered without
+    # finding them. Reporting "no drift" over an empty list is the one outcome
+    # that looks like a clean sweep and covers nothing at all.
+    if not names:
+        raise GhError("the repository listing came back empty")
+    return names
 
 
 def fetch(repo, path):
     """A repository's file at its default branch, or None when it has none."""
-    return gh("api", f"repos/andornaut/{repo}/contents/{path}", "--jq", ".content")
+    return gh("api", f"repos/andornaut/{repo}/contents/{path}", "--jq", ".content", allow_missing=True)
 
 
 def decode(content):
@@ -201,7 +243,7 @@ def holds_language(repo, language):
     on the last name and stop it matching.
     """
     out = gh("api", f"repos/andornaut/{repo}/languages", "--jq", "keys[]")
-    return language in (out or "").splitlines()
+    return language in out.splitlines()
 
 
 def workflow_names(repo):
@@ -210,7 +252,13 @@ def workflow_names(repo):
     Named files rather than test.yml alone: a step that moves is otherwise
     skipped silently, which reads the same as having no drift.
     """
-    out = gh("api", f"repos/andornaut/{repo}/contents/.github/workflows", "--jq", ".[].name")
+    out = gh(
+        "api",
+        f"repos/andornaut/{repo}/contents/.github/workflows",
+        "--jq",
+        ".[].name",
+        allow_missing=True,
+    )
     return [n for n in (out or "").split() if n.endswith((".yml", ".yaml"))]
 
 
@@ -338,13 +386,19 @@ def main():
     parser.add_argument("--repo", help="check one repository rather than all of them")
     args = parser.parse_args()
 
-    names = [args.repo] if args.repo else repositories()
-    drifted = 0
-    for name in names:
-        for label, diff in check(name):
-            drifted += 1
-            print(f"\n===== {name}: {label}")
-            print(diff)
+    # The whole sweep, not each repository: a failure part way through leaves the
+    # repositories after it unread, so the run has no clean result to report.
+    try:
+        names = [args.repo] if args.repo else repositories()
+        drifted = 0
+        for name in names:
+            for label, diff in check(name):
+                drifted += 1
+                print(f"\n===== {name}: {label}")
+                print(diff)
+    except GhError as err:
+        print(f"sweep incomplete, so nothing is reported: {err}", file=sys.stderr)
+        return 2
 
     if drifted:
         print(f"\n{drifted} config(s) differ from configs/. Read the diff before deciding")

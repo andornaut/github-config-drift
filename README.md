@@ -55,6 +55,14 @@ absent and reported where the language is present and the config is not.
 Markdown has no exemption list. Every repository here carries at least a
 `README.md`, so both `.markdownlint-cli2.yaml` and the step are expected everywhere.
 
+A query that failed is neither presence nor absence, and the two are easy to
+confuse: `gh` exits non-zero for a file a repository does not carry and for a call
+that never reached an answer. Read the second as absence and a rate limited run
+goes quiet exactly where it should speak, since the language lookup that decides
+whether a config is expected would report the language missing. Only a 404 counts
+as an answer here. Anything else is retried, and a call that still fails ends the
+run with exit 2 rather than letting it report on the repositories it did reach.
+
 A repository with a `package.json` is expected to carry a `.lintstagedrc`, and its
 prettier entry to be `*` with `--ignore-unknown`. Only that entry is compared. The
 hook and CI have to cover one set of files: a hand-written list of types is how the
@@ -80,7 +88,7 @@ checkout is never consulted, so a stale one cannot skew a result.
 ## Running it
 
 ```bash
-python3 check-drift.py            # report, exit 1 on drift
+python3 check-drift.py            # report, exit 1 on drift, 2 if it could not finish
 python3 check-drift.py --repo gog # one repository
 ```
 
