@@ -351,6 +351,10 @@ def workflow_shape(text):
     if caps and TIMEOUT_RATIONALE not in comments:
         complaints.append("declares timeout-minutes with no rationale comment")
     elif len(caps) == 1:
+        # One cap only: the comment is written once per file and names a single
+        # number, so a file declaring two would have no one right word to carry
+        # and is asked for the sentinel alone.
+        #
         # A comment naming a cap the file no longer declares is worse than none:
         # it reads as a reason and is not one.
         word = CAP_WORDS.get(next(iter(caps)))
@@ -578,7 +582,12 @@ def main():
         # so --repo collects nothing and reports nothing.
         uses = None if args.repo else {}
         report = []
-        for name in names:
+        for number, name in enumerate(names, start=1):
+            # On stderr, and before the repository is read rather than after: the
+            # report is buffered, so a run killed by the job's own timeout prints
+            # none of it, and the last name here is the only thing that says how
+            # far it reached. stdout stays the report and nothing else.
+            print(f"[{number}/{len(names)}] {name}", file=sys.stderr)
             try:
                 rows = check(name, uses)
             except UNREADABLE as err:
