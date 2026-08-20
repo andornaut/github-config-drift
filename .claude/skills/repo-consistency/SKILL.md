@@ -14,9 +14,16 @@ configuration files (`.golangci.yml`, `ruff.toml`, `.markdownlint-cli2.yaml`,
 `eslint.config.base.mjs`, `.husky/pre-commit` and
 `.github/workflows/ai-attributions.yml`), the prettier entry in `.lintstagedrc`,
 and the ShellCheck and markdownlint steps pulled out of whichever workflow carries
-them. It reports absence as well as difference. This audit covers what that script does not read: repository
-settings, rulesets, workflow structure, and releases. Do not re-derive file drift
-by hand.
+them. It also reads each workflow for the shape every one of them holds, which
+costs no further calls: a job with no `timeout-minutes`, a file whose rationale
+comment is missing or names a cap the file no longer declares, a workflow with no
+top-level `permissions:`, and an action followed at a loose ref or at two versions
+across the estate. It reports absence as well as difference.
+
+This audit covers what that script does not read: repository settings, rulesets,
+releases, and the parts of a workflow that are about how it is wired rather than
+how it is shaped, meaning triggers, `needs:` gating and the test matrix. Do not
+re-derive file drift, workflow shape or the action tally by hand.
 
 Read its exit status, not only its last line: 0 is a clean sweep, 1 is drift, and 2
 is a sweep that could not be completed and is reporting nothing. Treat 2 as unknown
@@ -148,10 +155,12 @@ ecosystems and declared ones with no manifest.
 
 ### Action version pinning
 
-Tally `uses:` across all workflows. Expect one version per action. Legitimate
-floating refs: the operator's own actions at a major tag (`@v1`), and actions whose
-documented usage is a branch (`dtolnay/rust-toolchain@stable`). Anything else
-floating, or two versions of one action across repos, is drift.
+`check-drift.py` tallies this, so read its report rather than counting `uses:` by
+hand. What the report cannot decide is whether a ref it names is deliberate. The
+exemptions it already knows are the operator's own actions at a major tag (`@v1`),
+a commit SHA, and `dtolnay/rust-toolchain` at a channel or a declared Rust floor,
+one of each. A new exemption belongs in the script beside those, not in a note
+here: an exemption nobody encoded is one the next run reports again.
 
 ### Checks that reach the network to decide
 
