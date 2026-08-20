@@ -152,3 +152,87 @@ class TestAFailedQueryCannotReduceTheSweep:
         except cd.GhError:
             return
         raise AssertionError("an empty listing must not be reported as an estate with no drift")
+
+
+SOUND = """
+name: Test
+on:
+  push:
+    branches: ["**"]
+permissions:
+  contents: read
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    # Capped well under the six-hour default: nothing here runs longer than
+    # six minutes, so a job still going at fifteen has hung rather than failed.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+"""
+
+
+class TestWorkflowShape:
+    """Properties every workflow here holds, whose loss the workflow itself survives."""
+
+    def test_a_sound_workflow_reports_nothing(self):
+        assert cd.workflow_shape("test.yml", SOUND) == []
+
+    def test_a_job_without_a_timeout_is_reported(self):
+        theirs = SOUND.replace("    timeout-minutes: 15\n", "")
+        assert cd.workflow_shape("test.yml", theirs) == ["test.yml: job lint declares no timeout-minutes"]
+
+    def test_a_lost_rationale_comment_is_reported(self):
+        theirs = "\n".join(line for line in SOUND.splitlines() if not line.strip().startswith("#"))
+        assert cd.workflow_shape("test.yml", theirs) == ["test.yml: declares timeout-minutes with no rationale comment"]
+
+    def test_a_missing_permissions_block_is_reported(self):
+        theirs = SOUND.replace("permissions:\n  contents: read\n", "")
+        assert cd.workflow_shape("test.yml", theirs) == ["test.yml: declares no top-level permissions"]
+
+    def test_a_called_workflow_needs_no_timeout_of_its_own(self):
+        theirs = SOUND.replace("    runs-on: ubuntu-latest\n", "    uses: ./.github/workflows/other.yml\n")
+        theirs = theirs.replace("    timeout-minutes: 15\n", "")
+        assert "declares no timeout-minutes" not in " ".join(cd.workflow_shape("test.yml", theirs))
+
+    def test_faramirs_slower_suite_still_counts_as_a_rationale(self):
+        theirs = SOUND.replace("six minutes", "eight minutes")
+        assert cd.workflow_shape("test.yml", theirs) == []
+
+
+class TestPinning:
+    """One version per action, unless following a loose ref is the point."""
+
+    def test_one_version_everywhere_reports_nothing(self):
+        assert cd.pinning({"actions/checkout": {"v7.0.1": ["gog", "mrs"]}}) == []
+
+    def test_two_versions_across_repositories_is_reported(self):
+        found = cd.pinning({"actions/checkout": {"v7.0.1": ["gog"], "v6.0.0": ["mrs"]}})
+        assert len(found) == 1
+        assert "2 versions" in found[0][1]
+
+    def test_a_branch_ref_is_reported(self):
+        found = cd.pinning({"some/action": {"main": ["gog"]}})
+        assert len(found) == 1
+        assert "not a release" in found[0][1]
+
+    def test_the_operators_own_action_at_a_major_tag_is_deliberate(self):
+        assert cd.pinning({"andornaut/ai-attributions": {"v1": ["gog", "mrs"]}}) == []
+
+    def test_a_major_tag_on_someone_elses_action_is_still_loose(self):
+        found = cd.pinning({"someone/else": {"v1": ["gog"]}})
+        assert len(found) == 1
+        assert "not a release" in found[0][1]
+
+    def test_rust_toolchain_may_carry_a_channel_and_a_floor(self):
+        assert cd.pinning({cd.TOOLCHAIN: {"stable": ["filectrl"], "1.97": ["filectrl"]}}) == []
+
+
+class TestActionsUsed:
+    def test_local_and_unversioned_refs_are_skipped(self):
+        text = "jobs:\n  a:\n    steps:\n      - uses: ./.github/workflows/x.yml\n      - uses: bare/action\n"
+        assert cd.actions_used(text) == []
+
+    def test_a_pinned_ref_is_collected(self):
+        assert cd.actions_used("      - uses: actions/checkout@v7.0.1\n") == [("actions/checkout", "v7.0.1")]

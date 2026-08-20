@@ -20,6 +20,7 @@ import argparse
 import base64
 import difflib
 import json
+import re
 import subprocess
 import sys
 import time
@@ -54,6 +55,18 @@ MARKDOWN_LOCAL = (("ignores",),)
 # step. Everything else GitHub reports as Shell is expected to carry one: the
 # comparison below finds the step and skips a repository that has none, so a
 # gate that was never added reads exactly like a gate that passed.
+# The rationale comment every timeout carries, matched on its stable half: faramir
+# says "eight minutes" where the rest say "six", its suite being slower.
+TIMEOUT_RATIONALE = "so a job still going at fifteen has hung rather than"
+
+RELEASE_REF = re.compile(r"^v?\d+\.\d+\.\d+$")
+MAJOR_TAG = re.compile(r"^v\d+$")
+
+# rust-toolchain names a channel rather than a release, which is its documented
+# usage, and filectrl follows it at the declared Rust floor beside stable, so
+# both a non-release ref and two refs are the point here rather than drift.
+TOOLCHAIN = "dtolnay/rust-toolchain"
+
 SHELL_EXEMPT = {
     # tests/lint.sh runs ShellCheck itself. It renders Jinja templates to a
     # temporary copy before checking them, which the action cannot do.
@@ -274,8 +287,90 @@ def workflow_names(repo):
     return [n for n in (out or "").split() if n.endswith((".yml", ".yaml"))]
 
 
-def check(repo):
-    """Every drifted artifact in one repository, as (label, diff) pairs."""
+def workflow_shape(name, text):
+    """What a workflow must carry whatever it runs, as a list of complaints.
+
+    Read out of the body already fetched to compare the steps, so these cost no
+    further calls. Each is a property every workflow here holds, and losing one
+    is invisible: the workflow still runs and still reports success.
+    """
+    document = yaml.safe_load(text)
+    if not isinstance(document, dict):
+        return []
+    complaints = []
+
+    # Without one a hung job runs to the six-hour default, holding a runner and
+    # telling nobody.
+    for job_id, job in (document.get("jobs") or {}).items():
+        if not isinstance(job, dict) or "uses" in job:
+            continue
+        if "timeout-minutes" not in job:
+            complaints.append(f"job {job_id} declares no timeout-minutes")
+
+    # Once per file, above the first declaration. A file that lost it leaves the
+    # next reader no reason for the number.
+    if "timeout-minutes:" in text and TIMEOUT_RATIONALE not in text:
+        complaints.append("declares timeout-minutes with no rationale comment")
+
+    # Without a top-level block the workflow takes the repository default, which
+    # is read today and is a setting rather than a property of this file.
+    if "permissions" not in document:
+        complaints.append("declares no top-level permissions")
+
+    return [(f"{name}: {complaint}") for complaint in complaints]
+
+
+def actions_used(text):
+    """Every `uses:` ref in a workflow, as (action, version) pairs."""
+    pairs = []
+    for line in text.splitlines():
+        match = re.match(r"\s*(?:-\s+)?uses:\s*([^\s#]+)", line)
+        if not match:
+            continue
+        ref = match.group(1).strip("\"'")
+        if ref.startswith("./") or "@" not in ref:
+            continue
+        action, _, version = ref.rpartition("@")
+        pairs.append((action, version))
+    return pairs
+
+
+def deliberate_ref(action, version):
+    """Whether following `action` at `version` is a choice rather than a loose pin."""
+    if RELEASE_REF.match(version):
+        return True
+    # The operator's own actions are followed at a major tag, so a consumer moves
+    # with the releases that keep faith with it and stops at the one that does not.
+    if action.startswith("andornaut/") and MAJOR_TAG.match(version):
+        return True
+    return action == TOOLCHAIN
+
+
+def pinning(uses):
+    """Actions followed at a loose ref, or at more than one version across repositories.
+
+    Cross-repository by nature: one repository cannot show that another pins the
+    same action differently, which is the drift worth hearing about.
+    """
+    found = []
+    for action in sorted(uses):
+        versions = uses[action]
+        loose = sorted(v for v in versions if not deliberate_ref(action, v))
+        if loose:
+            found.append((action, f"followed at a ref that is not a release: {', '.join(loose)}"))
+            continue
+        if len(versions) > 1 and action != TOOLCHAIN:
+            spread = "; ".join(f"{v} in {', '.join(sorted(set(versions[v])))}" for v in sorted(versions))
+            found.append((action, f"followed at {len(versions)} versions across repositories: {spread}"))
+    return found
+
+
+def check(repo, uses=None):
+    """Every drifted artifact in one repository, as (label, diff) pairs.
+
+    `uses` accumulates the action refs seen, for the cross-repository tally that
+    one repository on its own cannot produce.
+    """
     found = []
 
     present = set()
@@ -361,6 +456,11 @@ def check(repo):
             continue
         text = decode(content)
 
+        found.extend((f"workflow shape ({name})", complaint) for complaint in workflow_shape(name, text))
+        if uses is not None:
+            for action, version in actions_used(text):
+                uses.setdefault(action, {}).setdefault(version, []).append(repo)
+
         theirs = workflow_step(text, "action-shellcheck")
         if theirs is not None:
             stepped = True
@@ -403,11 +503,19 @@ def main():
     try:
         names = [args.repo] if args.repo else repositories()
         drifted = 0
+        # The action tally only says something across the estate: one repository
+        # cannot show that another follows the same action at a different version,
+        # so --repo collects nothing and reports nothing.
+        uses = None if args.repo else {}
         for name in names:
-            for label, diff in check(name):
+            for label, diff in check(name, uses):
                 drifted += 1
                 print(f"\n===== {name}: {label}")
                 print(diff)
+        for action, complaint in pinning(uses or {}):
+            drifted += 1
+            print(f"\n===== {action}")
+            print(complaint)
     except GhError as err:
         print(f"sweep incomplete, so nothing is reported: {err}", file=sys.stderr)
         return 2

@@ -39,6 +39,26 @@ Where the copies are meant to differ, they differ in named places:
 
 The sweep skips those and compares the rest.
 
+## Workflow shape
+
+Beside the file comparison, each workflow is read for the properties every one of
+them holds, out of the body already fetched to compare the steps, so these cost no
+further calls:
+
+- every job declares `timeout-minutes`, since without one a hung job runs to the
+  six-hour default while holding a runner and telling nobody
+- a file declaring `timeout-minutes` carries the rationale comment once, so the next
+  reader has a reason for the number
+- every workflow declares a top-level `permissions:` block rather than taking the
+  repository default, which is a setting rather than a property of the file
+- an action is followed at one version across the estate, and at a release rather
+  than a branch. The operator's own actions at a major tag and `rust-toolchain` at a
+  channel are the deliberate exceptions, the second of which also carries the
+  declared Rust floor beside `stable`.
+
+The version tally is the one check that means nothing for a single repository, so
+`--repo` collects and reports none of it.
+
 ## Absence is reported, not skipped
 
 A gate nobody added reads exactly like one that passed, so presence is checked
