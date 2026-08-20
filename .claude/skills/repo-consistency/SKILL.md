@@ -83,6 +83,10 @@ query could have found it.
 - `actions/runs` also serves full, well-formed pages whose newest run is days old.
   Compare `max(.workflow_runs[].created_at)` against that repo's `.pushed_at` from
   `repos/{r}` and refetch until they agree.
+- `gh api --jq` writes the filter's output even when the request failed: a 404
+  body has no `.tag_name`, so `--jq '.tag_name'` writes `null` and the file is
+  non-empty. A presence test keyed on file size therefore reads every missing
+  object as present. Key it on the exit status or on a non-empty stderr instead.
 - In any loop that counts, default an empty capture to a non-zero sentinel, so a
   failed query cannot read as success.
 
@@ -182,10 +186,13 @@ gh api "repos/$r/releases/tags/$TAG"
 ```
 
 Tags predating the repository's `release.yml` legitimately have none: compare the
-tag date against when that file was added before calling one a gap. Confirm a
-suspected gap both ways, by the client-side run scan and by this endpoint. A tag
-with a release but no run found is a filter artifact. A tag with a run and no
-release is the real finding.
+tag date against when that file was added before calling one a gap. Compare full
+timestamps rather than dates: a repository whose first release workflow landed in
+the same push as its first tag has the two minutes apart, and a day-granularity
+comparison reports that tag as a gap. Zero runs for the tag confirms it predates
+the workflow. Confirm a suspected gap both ways, by the client-side run scan and by
+this endpoint. A tag with a release but no run found is a filter artifact. A tag
+with a run and no release is the real finding.
 
 ### Concurrency groups
 
