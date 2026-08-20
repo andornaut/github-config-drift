@@ -91,6 +91,10 @@ smaller than canon says, establish that the query could have found the rest.
 - Never pipe a search whose result you intend to count through `head`. A truncated
   list reads as a smaller estate, which turns a correct canon count into an apparent
   drift. Count the full result, and cap the output only after the count is taken.
+- `git ls-tree -r` lists a submodule as one `commit` entry rather than as the files
+  inside it, so every path under a submodule reads as absent to anything built on
+  that listing. Resolve the submodule's pinned commit before calling such a path
+  missing.
 - In any loop that counts, default an empty capture to a non-zero sentinel, so a
   failed query cannot read as success.
 
