@@ -65,6 +65,14 @@ query could have found it.
   re-walking the same work list: a list written with `'\n'.join(...)` has no
   trailing newline, so `while read` drops its final entry and the gap check inherits
   the same blind spot. Terminate generated work lists with a newline.
+- Brace a variable an underscore follows when a fan-out script names its output
+  file: `$r__runs.json` parses as `${r__}`, which is unset, so every repository
+  writes to the same path. That file exists and is non-empty, so the gap check
+  above passes while one repository's data stands in for all of them. Write
+  `${r}__runs.json`.
+- `gh api --slurp` needs gh 2.55 or newer. Where it is missing, the unknown-flag
+  error goes to stderr and the output file is left zero length. Fetch run history
+  as JSONL with `--paginate --jq '.workflow_runs[]'`, which works either way.
 - `gh api --jq` takes exactly one argument, the filter. Passing `--arg name value`
   alongside it fails on stderr and writes nothing to stdout, which a pipe into
   `wc -l` reads as zero findings. Interpolate the shell variable into the filter
