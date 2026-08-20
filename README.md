@@ -1,6 +1,6 @@
 # github-config-drift
 
-[![CI](https://github.com/andornaut/github-config-drift/actions/workflows/test.yml/badge.svg)](https://github.com/andornaut/github-config-drift/actions/workflows/test.yml)
+[![CI](https://github.com/andornaut/github-config-drift/actions/workflows/release.yml/badge.svg)](https://github.com/andornaut/github-config-drift/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 The canonical configuration every repository here is meant to carry, and the sweep

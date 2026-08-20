@@ -1,0 +1,124 @@
+name: Release
+
+# Every branch, not just main and pull requests: work lands on main directly as
+# often as it arrives through one, so a check that only runs on main is a check
+# that runs after the fact.
+on:
+  push:
+    branches: ["**"]
+    # Release versions only, the same set protect-release-tags guards.
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Write access is granted only to the jobs that create releases
+permissions:
+  contents: read
+
+# Keyed on the branch rather than the ref, so a re-push to one branch cancels
+# its own earlier run and not another branch's. Keyed by the event as well: a
+# cancelled run leaves its check runs on the head commit, and GitHub counts
+# those against the required checks, so a push and its pull request cancelling
+# each other would block the merge.
+# Qualified by the repository the branch lives in, since a fork names its
+# branches itself: two pull requests from different forks would otherwise share
+# a group whenever they pick the same branch name.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  # Publishing waits on the scan as well: a release is a durable artifact, and
+  # taking an attribution back off after one is cut means rewriting history that
+  # has already been published. Called only where a release can follow, since
+  # the scan workflow already runs on every push and pull request of its own
+  # accord.
+  attributions:
+    if: github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main')
+    uses: ./.github/workflows/ai-attributions.yml
+
+  # Publishing waits on the same suite that guards main, rather than on the
+  # build alone: something that packages cleanly still ships whatever the tests
+  # would have caught. Called only where a release can follow, since the Test
+  # workflow already runs on every push and pull request of its own accord, and
+  # the jobs below are gated the same way.
+  test:
+    if: github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main')
+    uses: ./.github/workflows/test.yml
+
+  # There is nothing to compile. The artifact is an archive rather than the
+  # script on its own, because `CANON` resolves `configs/` beside the script and
+  # a lone `check-drift.py` has nothing to compare a repository against. It is
+  # packed here rather than attached from the release job so that what ships is
+  # the tree one job read, not a second checkout of a ref that may have moved.
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    # Capped well under the six-hour default: nothing here runs longer than
+    # six minutes, so a job still going at fifteen has hung rather than failed.
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+        with:
+          # Nothing in this job uses the token, so it is not left
+          # in .git/config for a later step to read.
+          persist-credentials: false
+
+      - name: Pack the sweep and its canon
+        run: tar --create --gzip --file github-config-drift.tar.gz check-drift.py configs
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: github-config-drift
+          path: github-config-drift.tar.gz
+
+  release:
+    needs: [build, test, attributions]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    # The one job that writes: it publishes releases and moves the `dev` tag.
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: github-config-drift
+          path: artifacts
+
+      # A release follows its tag, and updating one below does not move the tag
+      # GitHub already has, so `dev` has to be repointed here or the release's
+      # commit link and source archives would describe an older build than the
+      # assets beside them. Unmasked on purpose: a rejected tag push (tag
+      # protection, or credentials the checkout did not persist) has to fail
+      # the job rather than quietly publish an archive with the wrong commit.
+      - name: Move the dev tag to this commit
+        if: github.ref == 'refs/heads/main'
+        run: |
+          git tag --force dev
+          git push --force origin refs/tags/dev
+
+      # Updated in place rather than deleted and recreated. Deleting first left
+      # `dev` a 404 for the length of the upload, and permanently if the run
+      # died in between; every asset name here is deterministic, so each upload
+      # replaces its predecessor and nothing from the previous cut survives.
+      - name: Publish release
+        uses: softprops/action-gh-release@v3.0.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref == 'refs/heads/main' && 'dev' || github.ref_name }}
+          name: ${{ github.ref == 'refs/heads/main' && 'dev' || github.ref_name }}
+          body: ${{ github.ref == 'refs/heads/main' && 'Latest build from main branch' || '' }}
+          generate_release_notes: ${{ github.ref != 'refs/heads/main' }}
+          make_latest: ${{ github.ref == 'refs/heads/main' && 'false' || 'true' }}
+          files: artifacts/github-config-drift.tar.gz
