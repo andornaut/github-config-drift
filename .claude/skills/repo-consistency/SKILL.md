@@ -11,9 +11,10 @@ surface each one so the operator confirms it as deliberate or repairs it.
 
 Run `python3 check-drift.py` in this repository first. It compares the shared
 configuration files (`.golangci.yml`, `ruff.toml`, `.markdownlint-cli2.yaml`,
-`eslint.config.base.mjs`, `.lintstagedrc`, `.husky/pre-commit` and
-`.github/workflows/ai-attributions.yml`) deterministically, and reports absence as
-well as difference. This audit covers what that script does not read: repository
+`eslint.config.base.mjs`, `.husky/pre-commit` and
+`.github/workflows/ai-attributions.yml`), the prettier entry in `.lintstagedrc`,
+and the ShellCheck and markdownlint steps pulled out of whichever workflow carries
+them. It reports absence as well as difference. This audit covers what that script does not read: repository
 settings, rulesets, workflow structure, and releases. Do not re-derive file drift
 by hand.
 
