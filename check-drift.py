@@ -51,22 +51,31 @@ SHELL_LOCAL = ("scandir", "ignore_paths")
 # per-repository input, so it is compared whole.
 MARKDOWN_LOCAL = (("ignores",),)
 
+# The rationale comment every timeout carries, matched on the half that holds
+# whatever the cap is: faramir says "eight minutes" where the rest say "six", and
+# a file capped at something other than fifteen would name that number too. The
+# sentinel must survive both, or the comment cannot be reworded to stay true.
+TIMEOUT_RATIONALE = "has hung rather than"
+
+# A release tag, or the commit it points at. A forty character SHA is the
+# strictest pin there is, so it must not be read as a loose one.
+RELEASE_REF = re.compile(r"^v?\d+\.\d+\.\d+$")
+COMMIT_REF = re.compile(r"^[0-9a-f]{40}$")
+MAJOR_TAG = re.compile(r"^v\d+$")
+
+# rust-toolchain documents a channel name as its usage, and filectrl follows it
+# at the declared Rust floor beside stable, so a channel and two refs are the
+# point here rather than drift. Anything past that pair, or a ref that is neither
+# a channel nor a Rust version, is drift like any other.
+TOOLCHAIN = "dtolnay/rust-toolchain"
+TOOLCHAIN_CHANNELS = ("stable", "beta", "nightly")
+TOOLCHAIN_REFS = 2
+RUST_VERSION = re.compile(r"^\d+\.\d+(\.\d+)?$")
+
 # Repositories that hold shell and are meant to have no canonical ShellCheck
 # step. Everything else GitHub reports as Shell is expected to carry one: the
 # comparison below finds the step and skips a repository that has none, so a
 # gate that was never added reads exactly like a gate that passed.
-# The rationale comment every timeout carries, matched on its stable half: faramir
-# says "eight minutes" where the rest say "six", its suite being slower.
-TIMEOUT_RATIONALE = "so a job still going at fifteen has hung rather than"
-
-RELEASE_REF = re.compile(r"^v?\d+\.\d+\.\d+$")
-MAJOR_TAG = re.compile(r"^v\d+$")
-
-# rust-toolchain names a channel rather than a release, which is its documented
-# usage, and filectrl follows it at the declared Rust floor beside stable, so
-# both a non-release ref and two refs are the point here rather than drift.
-TOOLCHAIN = "dtolnay/rust-toolchain"
-
 SHELL_EXEMPT = {
     # tests/lint.sh runs ShellCheck itself. It renders Jinja templates to a
     # temporary copy before checking them, which the action cannot do.
@@ -284,10 +293,13 @@ def workflow_names(repo):
         ".[].name",
         allow_missing=True,
     )
-    return [n for n in (out or "").split() if n.endswith((".yml", ".yaml"))]
+    # Split on lines rather than whitespace: a file name can hold a space, and a
+    # name broken in two fetches as a path that does not exist, which drops the
+    # whole workflow from every check below without saying so.
+    return [n for n in (out or "").splitlines() if n.endswith((".yml", ".yaml"))]
 
 
-def workflow_shape(name, text):
+def workflow_shape(text):
     """What a workflow must carry whatever it runs, as a list of complaints.
 
     Read out of the body already fetched to compare the steps, so these cost no
@@ -317,7 +329,7 @@ def workflow_shape(name, text):
     if "permissions" not in document:
         complaints.append("declares no top-level permissions")
 
-    return [(f"{name}: {complaint}") for complaint in complaints]
+    return complaints
 
 
 def actions_used(text):
@@ -337,13 +349,15 @@ def actions_used(text):
 
 def deliberate_ref(action, version):
     """Whether following `action` at `version` is a choice rather than a loose pin."""
-    if RELEASE_REF.match(version):
+    if RELEASE_REF.match(version) or COMMIT_REF.match(version):
         return True
     # The operator's own actions are followed at a major tag, so a consumer moves
     # with the releases that keep faith with it and stops at the one that does not.
     if action.startswith("andornaut/") and MAJOR_TAG.match(version):
         return True
-    return action == TOOLCHAIN
+    if action == TOOLCHAIN:
+        return version in TOOLCHAIN_CHANNELS or bool(RUST_VERSION.match(version))
+    return False
 
 
 def pinning(uses):
@@ -357,9 +371,13 @@ def pinning(uses):
         versions = uses[action]
         loose = sorted(v for v in versions if not deliberate_ref(action, v))
         if loose:
-            found.append((action, f"followed at a ref that is not a release: {', '.join(loose)}"))
+            # Named with the repositories that carry them: the point of the tally
+            # is to say where to go, and the caller already holds that list.
+            where = "; ".join(f"{v} in {', '.join(sorted(set(versions[v])))}" for v in loose)
+            found.append((action, f"followed at a ref that is not a release: {where}"))
             continue
-        if len(versions) > 1 and action != TOOLCHAIN:
+        allowed = TOOLCHAIN_REFS if action == TOOLCHAIN else 1
+        if len(versions) > allowed:
             spread = "; ".join(f"{v} in {', '.join(sorted(set(versions[v])))}" for v in sorted(versions))
             found.append((action, f"followed at {len(versions)} versions across repositories: {spread}"))
     return found
@@ -456,7 +474,7 @@ def check(repo, uses=None):
             continue
         text = decode(content)
 
-        found.extend((f"workflow shape ({name})", complaint) for complaint in workflow_shape(name, text))
+        found.extend((f"workflow shape ({name})", complaint) for complaint in workflow_shape(text))
         if uses is not None:
             for action, version in actions_used(text):
                 uses.setdefault(action, {}).setdefault(version, []).append(repo)
@@ -500,28 +518,28 @@ def main():
 
     # The whole sweep, not each repository: a failure part way through leaves the
     # repositories after it unread, so the run has no clean result to report.
+    # Collected rather than printed as it is found, so that a run which cannot be
+    # completed prints nothing at all. Half a report reads as a whole one: the
+    # repositories after the failure are unread, and a reader has no way to tell
+    # which half is missing.
     try:
         names = [args.repo] if args.repo else repositories()
-        drifted = 0
         # The action tally only says something across the estate: one repository
         # cannot show that another follows the same action at a different version,
         # so --repo collects nothing and reports nothing.
         uses = None if args.repo else {}
-        for name in names:
-            for label, diff in check(name, uses):
-                drifted += 1
-                print(f"\n===== {name}: {label}")
-                print(diff)
-        for action, complaint in pinning(uses or {}):
-            drifted += 1
-            print(f"\n===== {action}")
-            print(complaint)
+        report = [(f"{name}: {label}", diff) for name in names for label, diff in check(name, uses)]
+        report += pinning(uses or {})
     except GhError as err:
         print(f"sweep incomplete, so nothing is reported: {err}", file=sys.stderr)
         return 2
 
-    if drifted:
-        print(f"\n{drifted} config(s) differ from configs/. Read the diff before deciding")
+    for heading, body in report:
+        print(f"\n===== {heading}")
+        print(body)
+
+    if report:
+        print(f"\n{len(report)} config(s) differ from configs/. Read the diff before deciding")
         print("which side moves: a repository ahead of canon is worth adopting, not reverting.")
         return 1
     print(f"{len(names)} repositories checked, no drift.")

@@ -58,7 +58,26 @@ jobs:
       # The default token reaches them because they are all public, and the
       # script lists them through the anonymous endpoint for the same reason: a
       # workflow token is not a user, so `user/repos` returns nothing for it.
+      # The two failures are not the same news, and a red job alone cannot tell
+      # them apart: 1 is drift to reconcile, 2 is a run that could not finish and
+      # reported nothing, which says nothing about whether anything drifted.
+      # Annotated so the distinction survives into the run summary, rather than
+      # waiting for someone to open the log.
       - name: Check for drift
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python3 check-drift.py
+        # Captured through `||` rather than after `&&`: this step runs under
+        # `bash -e`, where a failing and-list ends the script before the status
+        # can be read, and the annotation would never be written.
+        run: |
+          status=0
+          python3 check-drift.py || status=$?
+          if [ "$status" -eq 0 ]; then
+            exit 0
+          fi
+          if [ "$status" -eq 2 ]; then
+            echo "::warning::the sweep could not be completed, so nothing was compared"
+          else
+            echo "::error::a config has drifted from configs/"
+          fi
+          exit "$status"

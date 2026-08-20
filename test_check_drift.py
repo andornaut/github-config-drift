@@ -177,28 +177,28 @@ class TestWorkflowShape:
     """Properties every workflow here holds, whose loss the workflow itself survives."""
 
     def test_a_sound_workflow_reports_nothing(self):
-        assert cd.workflow_shape("test.yml", SOUND) == []
+        assert cd.workflow_shape(SOUND) == []
 
     def test_a_job_without_a_timeout_is_reported(self):
         theirs = SOUND.replace("    timeout-minutes: 15\n", "")
-        assert cd.workflow_shape("test.yml", theirs) == ["test.yml: job lint declares no timeout-minutes"]
+        assert cd.workflow_shape(theirs) == ["job lint declares no timeout-minutes"]
 
     def test_a_lost_rationale_comment_is_reported(self):
         theirs = "\n".join(line for line in SOUND.splitlines() if not line.strip().startswith("#"))
-        assert cd.workflow_shape("test.yml", theirs) == ["test.yml: declares timeout-minutes with no rationale comment"]
+        assert cd.workflow_shape(theirs) == ["declares timeout-minutes with no rationale comment"]
 
     def test_a_missing_permissions_block_is_reported(self):
         theirs = SOUND.replace("permissions:\n  contents: read\n", "")
-        assert cd.workflow_shape("test.yml", theirs) == ["test.yml: declares no top-level permissions"]
+        assert cd.workflow_shape(theirs) == ["declares no top-level permissions"]
 
     def test_a_called_workflow_needs_no_timeout_of_its_own(self):
         theirs = SOUND.replace("    runs-on: ubuntu-latest\n", "    uses: ./.github/workflows/other.yml\n")
         theirs = theirs.replace("    timeout-minutes: 15\n", "")
-        assert "declares no timeout-minutes" not in " ".join(cd.workflow_shape("test.yml", theirs))
+        assert "declares no timeout-minutes" not in " ".join(cd.workflow_shape(theirs))
 
     def test_faramirs_slower_suite_still_counts_as_a_rationale(self):
         theirs = SOUND.replace("six minutes", "eight minutes")
-        assert cd.workflow_shape("test.yml", theirs) == []
+        assert cd.workflow_shape(theirs) == []
 
 
 class TestPinning:
@@ -236,3 +236,30 @@ class TestActionsUsed:
 
     def test_a_pinned_ref_is_collected(self):
         assert cd.actions_used("      - uses: actions/checkout@v7.0.1\n") == [("actions/checkout", "v7.0.1")]
+
+    def test_a_cap_other_than_fifteen_may_reword_its_comment(self):
+        theirs = SOUND.replace("timeout-minutes: 15", "timeout-minutes: 30")
+        theirs = theirs.replace("going at fifteen", "going at thirty")
+        assert cd.workflow_shape(theirs) == []
+
+
+class TestPinningRefinements:
+    """The exemptions are for the refs that are deliberate, not for the action."""
+
+    def test_a_commit_pin_is_the_strictest_pin_not_a_loose_one(self):
+        assert cd.pinning({"actions/checkout": {"a" * 40: ["gog"]}}) == []
+
+    def test_the_toolchain_at_a_branch_is_still_reported(self):
+        found = cd.pinning({cd.TOOLCHAIN: {"master": ["filectrl"]}})
+        assert len(found) == 1
+        assert "not a release" in found[0][1]
+
+    def test_the_toolchain_past_a_channel_and_a_floor_is_reported(self):
+        found = cd.pinning({cd.TOOLCHAIN: {"stable": ["a"], "1.97": ["b"], "1.90": ["c"]}})
+        assert len(found) == 1
+        assert "3 versions" in found[0][1]
+
+    def test_a_loose_ref_names_the_repositories_carrying_it(self):
+        found = cd.pinning({"some/action": {"main": ["gog", "mrs"]}})
+        assert "gog" in found[0][1]
+        assert "mrs" in found[0][1]
