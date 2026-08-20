@@ -27,3 +27,11 @@ Thumbs.db
 AGENTS.md
 CLAUDE.md
 GEMINI.md
+
+# The audit skill is committed here; the rest of .claude is machine-local.
+# `.claude/` is excluded by the global ignore, and a negation cannot reach
+# inside an excluded directory, so the directory is re-included first and its
+# contents excluded again.
+!.claude/
+.claude/*
+!.claude/skills/
