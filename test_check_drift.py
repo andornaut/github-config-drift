@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """Unit tests for check-drift.py."""
 
+import binascii
 import importlib.machinery
 
 # Import the module by path: its name is not a Python identifier
 import importlib.util
+import json
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
+import yaml
 
 module_path = Path(__file__).parent / "check-drift.py"
 loader = importlib.machinery.SourceFileLoader("check_drift", str(module_path))
@@ -263,3 +267,30 @@ class TestPinningRefinements:
         found = cd.pinning({"some/action": {"main": ["gog", "mrs"]}})
         assert "gog" in found[0][1]
         assert "mrs" in found[0][1]
+
+    def test_the_majority_is_counted_rather_than_listed(self):
+        many = {"some/action": {"main": [f"repo{n}" for n in range(9)]}}
+        found = cd.pinning(many)
+        assert "9 repositories" in found[0][1]
+        assert "repo0" not in found[0][1]
+
+    def test_a_few_carriers_are_still_named(self):
+        found = cd.pinning({"some/action": {"main": ["gog", "mrs"]}})
+        assert "gog, mrs" in found[0][1]
+
+
+class TestUnreadableFiles:
+    """A file no parser can read is drift, not a traceback that exits like drift."""
+
+    def test_every_parser_failure_is_caught_as_unreadable(self):
+        for err in (
+            yaml.YAMLError("bad"),
+            tomllib.TOMLDecodeError("bad"),
+            json.JSONDecodeError("bad", "doc", 0),
+            binascii.Error("bad"),
+            UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad"),
+        ):
+            assert isinstance(err, cd.UNREADABLE)
+
+    def test_a_gh_failure_is_not_swallowed_as_unreadable(self):
+        assert not isinstance(cd.GhError("bad"), cd.UNREADABLE)

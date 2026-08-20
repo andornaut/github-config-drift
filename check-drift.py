@@ -18,6 +18,7 @@ answer.
 
 import argparse
 import base64
+import binascii
 import difflib
 import json
 import re
@@ -96,6 +97,15 @@ class GhError(RuntimeError):
 # language missing, and the check that would have named an unconfigured gate is
 # skipped. 404 is the missing-file case; everything else is retried and then
 # raised.
+# A file no parser can read is drift rather than a crash. Left to raise, it ends
+# the run with a traceback and exit 1, which is the code for drift found: the
+# reader cannot tell a repository with a broken file from one with a drifted one.
+UNREADABLE = (yaml.YAMLError, tomllib.TOMLDecodeError, json.JSONDecodeError, binascii.Error, UnicodeDecodeError)
+
+# How many repositories a complaint names before it counts them instead. The
+# outlier is what the reader needs; the majority carrying the right ref is noise.
+NAMED_REPOS = 5
+
 MISSING = "HTTP 404"
 ATTEMPTS = 3
 
@@ -360,6 +370,14 @@ def deliberate_ref(action, version):
     return False
 
 
+def carriers(repos):
+    """The repositories carrying a ref, named while there are few enough to name."""
+    unique = sorted(set(repos))
+    if len(unique) > NAMED_REPOS:
+        return f"{len(unique)} repositories"
+    return ", ".join(unique)
+
+
 def pinning(uses):
     """Actions followed at a loose ref, or at more than one version across repositories.
 
@@ -373,12 +391,12 @@ def pinning(uses):
         if loose:
             # Named with the repositories that carry them: the point of the tally
             # is to say where to go, and the caller already holds that list.
-            where = "; ".join(f"{v} in {', '.join(sorted(set(versions[v])))}" for v in loose)
+            where = "; ".join(f"{v} in {carriers(versions[v])}" for v in loose)
             found.append((action, f"followed at a ref that is not a release: {where}"))
             continue
         allowed = TOOLCHAIN_REFS if action == TOOLCHAIN else 1
         if len(versions) > allowed:
-            spread = "; ".join(f"{v} in {', '.join(sorted(set(versions[v])))}" for v in sorted(versions))
+            spread = "; ".join(f"{v} in {carriers(versions[v])}" for v in sorted(versions))
             found.append((action, f"followed at {len(versions)} versions across repositories: {spread}"))
     return found
 
@@ -528,7 +546,13 @@ def main():
         # cannot show that another follows the same action at a different version,
         # so --repo collects nothing and reports nothing.
         uses = None if args.repo else {}
-        report = [(f"{name}: {label}", diff) for name in names for label, diff in check(name, uses)]
+        report = []
+        for name in names:
+            try:
+                rows = check(name, uses)
+            except UNREADABLE as err:
+                rows = [("unreadable file", f"{type(err).__name__}: {err}")]
+            report += [(f"{name}: {label}", diff) for label, diff in rows]
         report += pinning(uses or {})
     except GhError as err:
         print(f"sweep incomplete, so nothing is reported: {err}", file=sys.stderr)
