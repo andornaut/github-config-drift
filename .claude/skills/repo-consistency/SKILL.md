@@ -101,6 +101,12 @@ smaller than canon says, establish that the query could have found the rest.
   missing.
 - In any loop that counts, default an empty capture to a non-zero sentinel, so a
   failed query cannot read as success.
+- A per-repository check that prints only when it finds something says exactly the
+  same thing about a clean repository and about one whose query failed: nothing.
+  Silence across the estate is then indistinguishable from a fan-out that never
+  ran. Write a result file and an exit status per repository, assert every expected
+  one is present and zero, and derive the finding from those rather than from what
+  reached the terminal.
 
 ## Checks that find real problems
 
