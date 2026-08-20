@@ -18,6 +18,10 @@ them. It reports absence as well as difference. This audit covers what that scri
 settings, rulesets, workflow structure, and releases. Do not re-derive file drift
 by hand.
 
+Read its exit status, not only its last line: 0 is a clean sweep, 1 is drift, and 2
+is a sweep that could not be completed and is reporting nothing. Treat 2 as unknown
+rather than clean, and re-run it before relying on any of the file-drift layer.
+
 ## Scope
 
 Audit repositories owned by the operator, excluding:
