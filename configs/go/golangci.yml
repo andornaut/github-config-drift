@@ -13,8 +13,14 @@ linters:
     - whitespace
     # Bans `if err := f(); err != nil`, which is the error idiom used here.
     - noinlineerr
-    # Every struct literal must set every field, including its zero values.
+    # Superseded by gomodguard_v2, which `default: all` enables in its place.
+    # Named here only to stop the deprecation warning it prints otherwise.
+    - gomodguard
+    # Every struct literal must set every field, including its zero values. Both
+    # names: `default: all` enables what a rename leaves unmatched, so a stale
+    # entry here reads as disabled and is not.
     - exhaustruct
+    - exhaustruct_v5
     # Minimum identifier length, and a ban on named returns.
     - varnamelen
     - nonamedreturns
@@ -65,6 +71,12 @@ linters:
     # are written; without this the linter wants every case spelled out anyway.
     exhaustive:
       default-signifies-exhaustive: true
+    goconst:
+      # A map key is where a wire format gets spelled: the fields of a record,
+      # a JSON-RPC envelope, a JSON Schema. The literal around it already names
+      # it, and a constant would move the spelling away from where it is read.
+      # Everything else goconst looks at still applies.
+      ignore-map-keys: true
     gosec:
       excludes:
         - G204 # subprocess launched with variable - git commands
