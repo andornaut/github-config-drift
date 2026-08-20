@@ -52,11 +52,24 @@ SHELL_LOCAL = ("scandir", "ignore_paths")
 # per-repository input, so it is compared whole.
 MARKDOWN_LOCAL = (("ignores",),)
 
-# The rationale comment every timeout carries, matched on the half that holds
-# whatever the cap is: faramir says "eight minutes" where the rest say "six", and
-# a file capped at something other than fifteen would name that number too. The
-# sentinel must survive both, or the comment cannot be reworded to stay true.
+# The half of the rationale comment that holds whatever the cap is: faramir says
+# "eight minutes" where the rest say "six", so the sentinel cannot name a
+# duration. The cap itself is still checked, against the word below, or the
+# comment would be free to name a number the file no longer declares.
 TIMEOUT_RATIONALE = "has hung rather than"
+
+# The cap as the comment spells it. A file capped at a number absent here is
+# asked only for the sentinel: a rationale that cannot be checked word for word
+# is better than one reported as missing because this table is short.
+CAP_WORDS = {
+    5: "five",
+    10: "ten",
+    15: "fifteen",
+    20: "twenty",
+    30: "thirty",
+    45: "forty-five",
+    60: "sixty",
+}
 
 # A release tag, or the commit it points at. A forty character SHA is the
 # strictest pin there is, so it must not be read as a loose one.
@@ -69,8 +82,7 @@ MAJOR_TAG = re.compile(r"^v\d+$")
 # point here rather than drift. Anything past that pair, or a ref that is neither
 # a channel nor a Rust version, is drift like any other.
 TOOLCHAIN = "dtolnay/rust-toolchain"
-TOOLCHAIN_CHANNELS = ("stable", "beta", "nightly")
-TOOLCHAIN_REFS = 2
+CHANNEL_REF = re.compile(r"^(stable|beta|nightly)(-\d{4}-\d{2}-\d{2})?$")
 RUST_VERSION = re.compile(r"^\d+\.\d+(\.\d+)?$")
 
 # Repositories that hold shell and are meant to have no canonical ShellCheck
@@ -323,16 +335,27 @@ def workflow_shape(text):
 
     # Without one a hung job runs to the six-hour default, holding a runner and
     # telling nobody.
+    caps = set()
     for job_id, job in (document.get("jobs") or {}).items():
         if not isinstance(job, dict) or "uses" in job:
             continue
         if "timeout-minutes" not in job:
             complaints.append(f"job {job_id} declares no timeout-minutes")
+        elif isinstance(job["timeout-minutes"], int):
+            caps.add(job["timeout-minutes"])
 
-    # Once per file, above the first declaration. A file that lost it leaves the
-    # next reader no reason for the number.
-    if "timeout-minutes:" in text and TIMEOUT_RATIONALE not in text:
+    # Once per file, above the first declaration. Read out of the comment lines
+    # rather than the whole body, so a `run:` block quoting the sentence cannot
+    # stand in for the comment.
+    comments = "\n".join(line for line in text.splitlines() if line.lstrip().startswith("#"))
+    if caps and TIMEOUT_RATIONALE not in comments:
         complaints.append("declares timeout-minutes with no rationale comment")
+    elif len(caps) == 1:
+        # A comment naming a cap the file no longer declares is worse than none:
+        # it reads as a reason and is not one.
+        word = CAP_WORDS.get(next(iter(caps)))
+        if word and word not in comments:
+            complaints.append(f"the rationale comment does not name the {next(iter(caps))} minute cap")
 
     # Without a top-level block the workflow takes the repository default, which
     # is read today and is a setting rather than a property of this file.
@@ -366,7 +389,7 @@ def deliberate_ref(action, version):
     if action.startswith("andornaut/") and MAJOR_TAG.match(version):
         return True
     if action == TOOLCHAIN:
-        return version in TOOLCHAIN_CHANNELS or bool(RUST_VERSION.match(version))
+        return bool(CHANNEL_REF.match(version) or RUST_VERSION.match(version))
     return False
 
 
@@ -394,8 +417,16 @@ def pinning(uses):
             where = "; ".join(f"{v} in {carriers(versions[v])}" for v in loose)
             found.append((action, f"followed at a ref that is not a release: {where}"))
             continue
-        allowed = TOOLCHAIN_REFS if action == TOOLCHAIN else 1
-        if len(versions) > allowed:
+        if action == TOOLCHAIN:
+            # A channel and a floor is the pair that is deliberate. Two channels,
+            # or two declared floors, is the same drift as anywhere else.
+            channels = [v for v in versions if CHANNEL_REF.match(v)]
+            floors = [v for v in versions if RUST_VERSION.match(v)]
+            if len(channels) > 1 or len(floors) > 1:
+                spread = "; ".join(f"{v} in {carriers(versions[v])}" for v in sorted(versions))
+                found.append((action, f"followed at {len(versions)} versions across repositories: {spread}"))
+            continue
+        if len(versions) > 1:
             spread = "; ".join(f"{v} in {carriers(versions[v])}" for v in sorted(versions))
             found.append((action, f"followed at {len(versions)} versions across repositories: {spread}"))
     return found

@@ -191,6 +191,20 @@ class TestWorkflowShape:
         theirs = "\n".join(line for line in SOUND.splitlines() if not line.strip().startswith("#"))
         assert cd.workflow_shape(theirs) == ["declares timeout-minutes with no rationale comment"]
 
+    def test_a_cap_other_than_fifteen_may_reword_its_comment(self):
+        theirs = SOUND.replace("timeout-minutes: 15", "timeout-minutes: 30")
+        theirs = theirs.replace("going at fifteen", "going at thirty")
+        assert cd.workflow_shape(theirs) == []
+
+    def test_a_comment_naming_a_cap_the_file_no_longer_declares_is_reported(self):
+        theirs = SOUND.replace("timeout-minutes: 15", "timeout-minutes: 30")
+        assert cd.workflow_shape(theirs) == ["the rationale comment does not name the 30 minute cap"]
+
+    def test_the_sentinel_in_a_run_block_does_not_stand_in_for_a_comment(self):
+        theirs = "\n".join(line for line in SOUND.splitlines() if not line.strip().startswith("#"))
+        theirs += '\n      - run: echo "has hung rather than failed"\n'
+        assert cd.workflow_shape(theirs) == ["declares timeout-minutes with no rationale comment"]
+
     def test_a_missing_permissions_block_is_reported(self):
         theirs = SOUND.replace("permissions:\n  contents: read\n", "")
         assert cd.workflow_shape(theirs) == ["declares no top-level permissions"]
@@ -241,11 +255,6 @@ class TestActionsUsed:
     def test_a_pinned_ref_is_collected(self):
         assert cd.actions_used("      - uses: actions/checkout@v7.0.1\n") == [("actions/checkout", "v7.0.1")]
 
-    def test_a_cap_other_than_fifteen_may_reword_its_comment(self):
-        theirs = SOUND.replace("timeout-minutes: 15", "timeout-minutes: 30")
-        theirs = theirs.replace("going at fifteen", "going at thirty")
-        assert cd.workflow_shape(theirs) == []
-
 
 class TestPinningRefinements:
     """The exemptions are for the refs that are deliberate, not for the action."""
@@ -294,3 +303,19 @@ class TestUnreadableFiles:
 
     def test_a_gh_failure_is_not_swallowed_as_unreadable(self):
         assert not isinstance(cd.GhError("bad"), cd.UNREADABLE)
+
+    def test_a_channel_and_a_floor_is_the_deliberate_pair(self):
+        assert cd.pinning({cd.TOOLCHAIN: {"stable": ["filectrl"], "1.97": ["filectrl"]}}) == []
+
+    def test_two_declared_floors_and_no_channel_is_reported(self):
+        found = cd.pinning({cd.TOOLCHAIN: {"1.90": ["filectrl"], "1.97": ["other"]}})
+        assert len(found) == 1
+        assert "2 versions" in found[0][1]
+
+    def test_two_channels_is_reported(self):
+        found = cd.pinning({cd.TOOLCHAIN: {"beta": ["a"], "nightly": ["b"]}})
+        assert len(found) == 1
+        assert "2 versions" in found[0][1]
+
+    def test_a_dated_channel_is_documented_usage(self):
+        assert cd.pinning({cd.TOOLCHAIN: {"nightly-2026-01-01": ["filectrl"]}}) == []

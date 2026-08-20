@@ -58,26 +58,32 @@ jobs:
       # The default token reaches them because they are all public, and the
       # script lists them through the anonymous endpoint for the same reason: a
       # workflow token is not a user, so `user/repos` returns nothing for it.
-      # The two failures are not the same news, and a red job alone cannot tell
-      # them apart: 1 is drift to reconcile, 2 is a run that could not finish and
-      # reported nothing, which says nothing about whether anything drifted.
-      # Annotated so the distinction survives into the run summary, rather than
-      # waiting for someone to open the log.
+      # The failures are not the same news, and a red job alone cannot tell them
+      # apart: 1 is drift to reconcile, and anything else is a run that did not
+      # get to say. Annotated so the distinction survives into the run summary,
+      # rather than waiting for someone to open the log.
+      #
+      # Only 1 is reported as drift. The script exits 2 when it knows it could
+      # not finish, but it can also die without choosing a code at all, on a
+      # signal or an exception it does not catch, and 127 when python is missing.
+      # Calling any of those drift would put back the conflation this replaced.
       - name: Check for drift
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        # Captured through `||` rather than after `&&`: this step runs under
-        # `bash -e`, where a failing and-list ends the script before the status
-        # can be read, and the annotation would never be written.
+        # Captured through `||` so the assignment happens whatever the script
+        # does. This step runs under `bash -e`, which exempts a command in an
+        # and-or list from errexit, so `&&` would also reach the lines below;
+        # `||` is the form that sets the variable rather than leaving the reader
+        # to work out that `$?` survived the list.
         run: |
           status=0
           python3 check-drift.py || status=$?
           if [ "$status" -eq 0 ]; then
             exit 0
           fi
-          if [ "$status" -eq 2 ]; then
-            echo "::warning::the sweep could not be completed, so nothing was compared"
-          else
+          if [ "$status" -eq 1 ]; then
             echo "::error::a config has drifted from configs/"
+          else
+            echo "::warning::the sweep did not finish, so nothing was compared (exit ${status})"
           fi
           exit "$status"
