@@ -97,10 +97,7 @@ job id) and its triggers, then compare against the ruleset's required contexts.
 
 - **Ruleset requires a context no job produces**: nothing ever reports it, so every
   PR blocks forever. A required check that stops reporting is indistinguishable from
-  one that never ran. A GitHub App reports check runs too, so read the head commit's
-  `check-runs` before calling a context unproduced: cloudflare-starter requires
-  `Workers Builds: cloudflare-starter`, which the cloudflare-workers-and-pages app
-  posts and no workflow in the tree does.
+  one that never ran.
 - **A ruleset named for requiring CI requires nothing**: the branch is unguarded
   despite looking protected.
 - **A job runs on the default branch but is not required**: a gate that is advisory.
