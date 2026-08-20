@@ -55,9 +55,10 @@ The rulesets **list** endpoint returns only id/name; rules require the per-id fe
 
 ### A zero is not an answer
 
-Every false finding this audit has produced came from a valid-shaped empty result
-read as a real zero. Before reporting that something is missing, establish that the
-query could have found it.
+Every false finding this audit has produced came from a valid-shaped short result
+read as the whole answer: an empty one taken for a real zero, or a truncated one
+taken for a real count. Before reporting that something is missing or that a set is
+smaller than canon says, establish that the query could have found the rest.
 
 - Backgrounded `gh` calls fail silently under load. After fetching, assert every
   expected output file exists and is non-empty, and refetch the gaps. Do the
@@ -87,6 +88,9 @@ query could have found it.
   body has no `.tag_name`, so `--jq '.tag_name'` writes `null` and the file is
   non-empty. A presence test keyed on file size therefore reads every missing
   object as present. Key it on the exit status or on a non-empty stderr instead.
+- Never pipe a search whose result you intend to count through `head`. A truncated
+  list reads as a smaller estate, which turns a correct canon count into an apparent
+  drift. Count the full result, and cap the output only after the count is taken.
 - In any loop that counts, default an empty capture to a non-zero sentinel, so a
   failed query cannot read as success.
 
