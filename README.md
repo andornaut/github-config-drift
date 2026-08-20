@@ -44,6 +44,8 @@ The sweep skips those and compares the rest.
 A gate nobody added reads exactly like one that passed, so presence is checked
 separately from content.
 
+Language presence comes from `repos/{r}/languages` rather than from a file glob:
+most of the shell scripts here carry no extension, and linguist reads the shebang.
 A repository GitHub reports as holding Shell is expected to carry the ShellCheck
 step at all. `SHELL_EXEMPT` in `check-drift.py` names the repositories that lint
 shell some other way, each with the reason. Go and Python are checked the same way,
@@ -66,6 +68,14 @@ repository, rather than by step as the ShellCheck and markdownlint gates are. It
 the attribution gate's own configuration, so a copy that quietly lost
 `agents-files`, `emdashes` or `fetch-depth` still runs, still reports success, and
 checks less than the others do.
+
+## Related
+
+[ai-attributions](https://github.com/andornaut/ai-attributions) is the other
+estate-wide checker, arranged the opposite way: it is a published GitHub Action
+that each repository runs on itself, over its own git history. This is one
+workflow, in one repository, reading all the others through the API. A local
+checkout is never consulted, so a stale one cannot skew a result.
 
 ## Running it
 

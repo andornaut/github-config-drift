@@ -1,6 +1,6 @@
 ---
 name: repo-consistency
-description: Audit @andornaut's GitHub repositories for consistency and correctness across repo settings, rulesets, and CI/CD workflows. Invoke when asked to review repos for consistency, check CI/CD across repositories, find configuration drift, or verify that global patterns hold. Reports deviations so each can be confirmed as deliberate or repaired.
+description: Audit @andornaut's GitHub repositories for consistency and correctness across repo settings, rulesets, CI/CD workflows and releases. Invoke when asked to review repos for consistency, check CI/CD across repositories, find configuration drift, or verify that global patterns hold. Reports deviations so each can be confirmed as deliberate or repaired.
 ---
 
 # Repository consistency audit
@@ -8,6 +8,14 @@ description: Audit @andornaut's GitHub repositories for consistency and correctn
 Establishes what the global pattern is by majority across repositories, then reports
 every deviation from it. A deviation is not automatically a defect: the point is to
 surface each one so the operator confirms it as deliberate or repairs it.
+
+Run `python3 check-drift.py` in this repository first. It compares the shared
+configuration files (`.golangci.yml`, `ruff.toml`, `.markdownlint-cli2.yaml`,
+`eslint.config.base.mjs`, `.lintstagedrc`, `.husky/pre-commit` and
+`.github/workflows/ai-attributions.yml`) deterministically, and reports absence as
+well as difference. This audit covers what that script does not read: repository
+settings, rulesets, workflow structure, and releases. Do not re-derive file drift
+by hand.
 
 ## Scope
 
@@ -39,16 +47,35 @@ cached JSON beats re-querying while iterating on the analysis.
 | Rulesets | `repos/{r}/rulesets`, then `repos/{r}/rulesets/{id}` for rules |
 | Legacy branch protection | `repos/{r}/branches/{b}/protection` |
 | Default token scope | `repos/{r}/actions/permissions/workflow` |
-| CI health | `repos/{r}/actions/runs?branch={b}&per_page=20` |
+| Run history | `repos/{r}/actions/runs?event=push` with `--paginate` |
+| Tags and releases | `repos/{r}/tags`, then `repos/{r}/releases/tags/{tag}` |
 
 The rulesets **list** endpoint returns only id/name; rules require the per-id fetch.
 
-Backgrounded `gh` calls fail silently under load. After fetching, assert every
-expected output file exists and is non-empty, and refetch the gaps. Do the assertion
-by diffing the set of files you expected against the set on disk, not by re-walking
-the same work list: a list written with `'\n'.join(...)` has no trailing newline, so
-`while read` drops its final entry and the gap check inherits the same blind spot.
-Terminate generated work lists with a newline.
+### A zero is not an answer
+
+Every false finding this audit has produced came from a valid-shaped empty result
+read as a real zero. Before reporting that something is missing, establish that the
+query could have found it.
+
+- Backgrounded `gh` calls fail silently under load. After fetching, assert every
+  expected output file exists and is non-empty, and refetch the gaps. Do the
+  assertion by diffing the set of files you expected against the set on disk, not by
+  re-walking the same work list: a list written with `'\n'.join(...)` has no
+  trailing newline, so `while read` drops its final entry and the gap check inherits
+  the same blind spot. Terminate generated work lists with a newline.
+- `gh api --jq` takes exactly one argument, the filter. Passing `--arg name value`
+  alongside it fails on stderr and writes nothing to stdout, which a pipe into
+  `wc -l` reads as zero findings. Interpolate the shell variable into the filter
+  string instead.
+- `actions/runs?branch={ref}` returns an empty array for some tag refs whose run
+  does exist. Fetch `runs?event=push --paginate` and filter `.head_branch`
+  client-side.
+- `actions/runs` also serves full, well-formed pages whose newest run is days old.
+  Compare `max(.workflow_runs[].created_at)` against that repo's `.pushed_at` from
+  `repos/{r}` and refetch until they agree.
+- In any loop that counts, default an empty capture to a non-zero sentinel, so a
+  failed query cannot read as success.
 
 ## Checks that find real problems
 
@@ -69,6 +96,10 @@ job id) and its triggers, then compare against the ruleset's required contexts.
 Only count jobs reachable from `pull_request` or a **branch-scoped** `push`. A
 `push:` block with only `tags:` is release-only and must not be counted. Matrix jobs
 report as `Name (leg)`, so a stable aggregator job is what a ruleset can require.
+
+A check name is its job's name, and contains spaces and matrix legs: `AI
+attributions`, `Test (node 20)`. Never split a check name on whitespace to parse a
+status list. Select on `conclusion` and compare whole names.
 
 ### Default `GITHUB_TOKEN` permissions
 
@@ -97,14 +128,12 @@ A gate that fetches something at run time reports a red check when that host is
 slow, and the failure looks like the change under test. Look for the shape in any
 action input defaulting to a remote lookup.
 
-Weigh it against what the lookup buys before removing it. `golangci-lint-action`
-defaults to `verify: true`, which runs `golangci-lint config verify`; that command
-builds a `https://golangci-lint.run/jsonschema/golangci.vN.M.jsonschema.json` URL
-and fetches it, so every run depends on that host. Keep it on anyway: `run` accepts
-an unknown *settings* key silently and exits 0, so a key misspelled inside
-`linters.settings` disables that setting while CI stays green, and only `config
-verify` rejects it. An unknown *linter name* is caught either way, by `run` itself.
-Trading a loud, retryable network failure for a silent one is the worse deal.
+`golangci-lint-action`'s `verify: true` is the known one: it runs `golangci-lint
+config verify`, which fetches a schema from `golangci-lint.run`. It stays on, and a
+slow host is a re-run rather than a reason to remove it. `golangci-lint run` accepts
+an unknown key inside `linters.settings` and exits 0, so a misspelled one disables
+that setting while CI stays green, and only `config verify` rejects it. Settled: do
+not re-propose turning it off.
 
 ### Release gated on its checks
 
@@ -126,6 +155,37 @@ grouping by name splits one workflow's history the moment that key is added or
 changed and surfaces a superseded failure as current. The `path` is stable across
 both. Exclude `event: dynamic` runs here: those are Dependabot's, covered below.
 
+This reports the health of the default branch and nothing else. Tags need their own
+pass.
+
+### Releases exist for every version tag
+
+Latest-run-per-path reports current health, not release health: a green push run on
+main supersedes the tag run for the same path, so a release that failed at its tag
+reads as success, leaving the tag in place with no release behind it. Nothing else
+surfaces that, and a registry publish done by hand still succeeds, so the package
+exists while the GitHub release does not.
+
+For every `v*.*.*` tag, confirm a release:
+
+```bash
+gh api "repos/$r/releases/tags/$TAG"
+```
+
+Tags predating the repository's `release.yml` legitimately have none: compare the
+tag date against when that file was added before calling one a gap. Confirm a
+suspected gap both ways, by the client-side run scan and by this endpoint. A tag
+with a release but no run found is a filter artifact. A tag with a run and no
+release is the real finding.
+
+### Concurrency groups
+
+A workflow reachable through `workflow_call` carries a literal prefix in its
+`concurrency.group` (`test-`, `attributions-`), so the run a caller starts and the
+run a push starts do not cancel each other. A workflow that is not callable begins
+its group with `${{` and is correct as it is. The split between the two shapes is
+the convention, not drift.
+
 ### Dependabot update jobs
 
 Dependabot's own runs appear in the Actions list under per-job names like
@@ -139,16 +199,13 @@ gh api "repos/$r/actions/runs?per_page=100" \
 ```
 
 A failure here means updates for that ecosystem silently stop while CI stays green.
-The log names the cause; `dependency_file_not_resolvable` against a language version
-usually means Dependabot picked its own default runtime because the manifest never
-declared one. Declaring it in the manifest is what fixes it: Dependabot does not read
-sidecar version files such as `.ruby-version`, and a `required_ruby_version` in a
-gemspec does not select a runtime.
-
-Adding a language directive makes the resolver write a version section into the
-lockfile. CI that installs with frozen set refuses to add one itself, so commit the
-lockfile in the same change, carrying the version CI installs rather than the one on
-the machine that generated it.
+Read the log for the cause. `dependency_file_not_resolvable` against a language
+version means the manifest never declared a runtime, so Dependabot picked its own
+default. Declare it in the manifest: Dependabot does not read sidecar version files
+such as `.ruby-version`, and a `required_ruby_version` in a gemspec does not select
+a runtime. Adding the directive makes the resolver write a version section into the
+lockfile, and CI that installs with frozen set refuses to add one itself, so commit
+the lockfile in the same change, carrying the version CI installs.
 
 ### Comments that no longer describe the code
 
@@ -168,7 +225,7 @@ peer groups that already exist so the choice is "match this group" rather than a
 open design question.
 
 Prefer landing a deviant file byte-identical to the canonical version, and verify
-with `diff` against a repo known to carry it.
+with `diff` against `configs/` in this repository.
 
 ## Editing rulesets
 
@@ -177,6 +234,29 @@ the rules array, and send back `name`, `target`, `enforcement`, `conditions`, th
 full `rules` array, and `bypass_actors` reduced to `actor_id`/`actor_type`/
 `bypass_mode`. Omitting `rules` entries silently drops them, so re-read after
 writing and confirm the untouched rules survived.
+
+`GET repos/{r}/rulesets/{id}` omits `bypass_actors` inconsistently. Never conclude
+"no bypass" from it alone: read it twice, or cross-check `current_user_can_bypass`,
+which reads `always` or `never` and is reliable.
+
+The bypass split is deliberate. **Branch** rulesets (`require-ci`, `protect-main`)
+carry `actor_id 5 / RepositoryRole / always`, because `required_status_checks` gates
+any ref update rather than only merges, and without the bypass a direct push to main
+is refused. **Tag** rulesets (`protect-release-tags`) carry none, because no
+automation touches `v*.*.*`. Do not "fix" a branch ruleset by stripping its bypass,
+and do not report a tag ruleset's empty list as a gap.
+
+Deleting or force-moving a `v*.*.*` tag therefore needs the ruleset amended first,
+which is the operator's call. When asked for it: PUT the full object with
+`bypass_actors` set to the same `actor_id 5 / RepositoryRole / always`, delete the
+tag, then PUT it back with `bypass_actors: []`. Save the GET output first and diff
+the restored object against it, because the read-back is the only proof the window
+closed. Confirm the rule is live again by pushing a delete of a tag that does not
+exist and matches the pattern (`git push origin :refs/tags/v9.9.9`): the ruleset
+refuses before it checks whether the ref exists, so the probe cannot lose a tag.
+Deleting a tag also breaks the `compare/<prev>...<this>` link in the next release's
+generated notes; repair it with `POST releases/generate-notes` naming the surviving
+previous tag, then PATCH the body.
 
 ## Committing
 
