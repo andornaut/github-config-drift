@@ -232,13 +232,14 @@ the convention, not drift.
 ### Dependabot update jobs
 
 Dependabot's own runs appear in the Actions list under per-job names like
-`bundler in /. - Update #1519000683`, one name per job, so a per-workflow-name
-sweep never sees a repeat and a page-limited fetch drops them entirely. Query them
-by pattern instead:
+`bundler in /. - Update #1519000683`, one name per job, so a per-workflow-name sweep
+never sees a repeat. Select them by event rather than by name, and paginate: on a
+repository with heavy push traffic the first page holds nothing but push runs, so a
+single-page fetch returns zero update jobs for a repository that has dozens.
 
 ```bash
-gh api "repos/$r/actions/runs?per_page=100" \
-  --jq '[.workflow_runs[]|select(.name|test("Update #"))|select(.conclusion=="failure")]|length'
+gh api --paginate "repos/$r/actions/runs?event=dynamic&per_page=100" \
+  --jq '.workflow_runs[]|select(.conclusion=="failure")|.name'
 ```
 
 A failure here means updates for that ecosystem silently stop while CI stays green.
