@@ -603,8 +603,9 @@ def main():
         print(body)
 
     if report:
-        print(f"\n{len(report)} config(s) differ from configs/. Read the diff before deciding")
-        print("which side moves: a repository ahead of canon is worth adopting, not reverting.")
+        print(f"\n{len(report)} finding(s). Where one is a difference from configs/, read the diff")
+        print("before deciding which side moves: a repository ahead of canon is worth adopting,")
+        print("not reverting.")
         return 1
     print(f"{len(names)} repositories checked, no drift.")
     return 0
