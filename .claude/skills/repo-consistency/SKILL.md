@@ -181,6 +181,40 @@ Workflows do not wait on each other. A green scan running *beside* a release say
 nothing about whether the release waited for it. A release job must reach its checks
 through `uses: ./.github/workflows/x.yml` plus `needs:`, not run alongside them.
 
+### Runtime pins against upstream support
+
+A repository names its runtime in a file (`.nvmrc`, `.ruby-version`,
+`.python-version`, `go.mod`) and nothing moves it: Dependabot does not read any of
+them, so a pinned line goes on being installed after upstream stops patching it.
+Read each pin against the release calendar and report any past its `eol` date.
+
+```bash
+curl -sS https://endoflife.date/api/ruby.json \
+  | jq -r '.[]|"\(.cycle) latest=\(.latest) eol=\(.eol)"'
+```
+
+A pin naming a minor (`3.12`) takes the newest patch on every run; one naming a
+patch (`v24.13.1`, `3.2.2`) freezes until someone edits it, so those are the ones
+that go stale. Moving one is more than the version file. The lockfile records the
+runtime as well (`RUBY VERSION` in `Gemfile.lock`), and CI installing with frozen
+set refuses to rewrite it, so regenerate the lockfile under the new runtime rather
+than editing that stanza. A linter may declare the version separately
+(rubocop's `TargetRubyVersion`), and rubocop rejects a gemspec whose
+`required_ruby_version` disagrees with it. A package's own floor
+(`required_ruby_version`, `engines.node`, `rust-version`) becomes a claim nothing
+checks the moment CI stops running at it, so move the floor with the pin or add a
+job that runs there.
+
+### Every path a workflow names resolves
+
+A path in a workflow is not checked until the run reaches it, and a `uses: ./` that
+names nothing fails the whole workflow rather than one step. Resolve each against
+the repository's tree: `uses: ./...`, `{go,node,python,ruby}-version-file:`,
+`working-directory:`, and a trigger's `paths:` filter. Normalise a leading `./`
+with `removeprefix`, never `lstrip('./')`, which strips every leading dot and makes
+each dotfile read as missing. Prove the checker can fail, by pointing one reference
+at a name that is not there, before believing it found none.
+
 ### Test matrix vs shipped platforms
 
 Compare the test matrix against release targets (`.goreleaser.yaml` `goos`, or
