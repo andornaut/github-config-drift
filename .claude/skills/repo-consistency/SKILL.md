@@ -294,6 +294,37 @@ a runtime. Adding the directive makes the resolver write a version section into 
 lockfile, and CI that installs with frozen set refuses to add one itself, so commit
 the lockfile in the same change, carrying the version CI installs.
 
+### Links that resolve only through a redirect
+
+A link that works today because the site rewrites it is one upstream decision from
+breaking, and nothing in CI looks at links at all. Request each one **without**
+following redirects and read the status: 200 is the page, a 3xx is the site
+correcting you.
+
+Sort what comes back before changing anything. A redirect to the identical page over
+https, or one GitHub issues for a repository that was renamed, is the site naming its
+own canonical address and is worth adopting. A redirect to a login page, a Stack
+Exchange `/a/NNN` short permalink expanding to its question, or `discord.gg` becoming
+`discord.com/invite` is normal behaviour and not drift. A deep page that lands on a
+docs root has lost the content, so following it makes the link worse.
+
+Two ways this check lies, both of which have produced wrong calls here:
+
+- A status is about the client as much as the page. Stack Exchange, Fandom, O'Reilly
+  and GitLab answer a scripted request with 403, freedesktop.org with 418, and a host
+  hit in parallel answers 429; none of that means the page is gone. The VS Code
+  Marketplace and crates.io return 404 without an `Accept: text/html` header, and
+  crates.io returns 200 for a crate that does not exist. A `000` is a dead domain, a
+  TLS failure or a timeout, and only `getent hosts` separates the first from the rest.
+  Take a non-200 as a question, never as a verdict, and recheck it serially.
+- Replacing a URL that is a prefix of another URL in the same file corrupts the longer
+  one, whichever order the replacements run in: rewriting `https://example.com/` to
+  `https://example.com/ca` turns an untouched `https://example.com/ca/downloads` into
+  `/caca/downloads`. Anchor the match on the full markdown link, or check afterwards
+  that every link the edit introduced still resolves. Verify the result, not the plan:
+  a batch of link edits is exactly the kind of change whose damage is invisible until
+  someone clicks.
+
 ### Comments that no longer describe the code
 
 Where a workflow comment states behavior, verify it against the implementation.
