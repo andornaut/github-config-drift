@@ -51,8 +51,9 @@ further calls:
   reader has a reason for the number
 - every workflow declares a top-level `permissions:` block rather than taking the
   repository default, which is a setting rather than a property of the file
-- an action is followed at one version across the estate, and at a release rather
-  than a branch. The operator's own actions at a major tag and `rust-toolchain` at a
+- an action is followed at one version across the estate, and at a ref that cannot
+  move: a release tag, or a commit sha where the action's tags are not watched
+  upstream. The operator's own actions at a major tag and `rust-toolchain` at a
   channel are the deliberate exceptions, the second of which also carries the
   declared Rust floor beside `stable`.
 
