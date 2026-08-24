@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for check-drift.py."""
 
+import base64
 import binascii
 
 # Import the module by path: its name is not a Python identifier
@@ -609,3 +610,259 @@ class TestMain:
         monkeypatch.setattr(cd, "check", check)
         assert cd.main() == 0
         assert seen == [("gog", None)]
+
+
+class TestConfigFindings:
+    """One lint config a repository does carry."""
+
+    def test_a_matching_config_reports_nothing(self):
+        text = '[lint]\nselect = ["E"]\n'
+        assert cd.config_findings(tomllib.loads, cd.PYTHON_LOCAL, "python", "ruff.toml", text, text) == []
+
+    def test_markdown_reports_the_diff_and_the_dropped_entries_together(self):
+        theirs = "config:\n  MD013: true\n"
+        found = cd.config_findings(
+            yaml.safe_load, cd.MARKDOWN_LOCAL, "markdown", ".markdownlint-cli2.yaml", CANON, theirs
+        )
+        assert [label for label, _ in found] == [".markdownlint-cli2.yaml", ".markdownlint-cli2.yaml"]
+        assert "MD013" in found[0][1]
+        assert found[1][1] == "ignores no longer names: **/node_modules/**, AGENTS.md, CLAUDE.md"
+
+    def test_only_markdown_is_asked_about_its_ignore_list(self):
+        theirs = "config:\n  MD013: false\n"
+        found = cd.config_findings(yaml.safe_load, cd.MARKDOWN_LOCAL, "go", ".golangci.yml", CANON, theirs)
+        assert found == []
+
+
+class TestAbsentConfigFindings:
+    """A lint config a repository does not carry, where one is expected."""
+
+    def test_markdown_is_expected_whatever_the_languages_say(self):
+        assert cd.absent_config_findings(lambda _: False, {"go", "python"}) == [
+            (".markdownlint-cli2.yaml", "no markdownlint config, and every repository here holds Markdown")
+        ]
+
+    def test_a_config_is_reported_only_where_github_reports_its_language(self):
+        found = cd.absent_config_findings(lambda language: language == "Go", {"markdown"})
+        assert found == [(".golangci.yml", "no go config, and GitHub reports Go")]
+
+    def test_a_language_github_does_not_report_needs_no_config(self):
+        assert cd.absent_config_findings(lambda _: False, {"markdown"}) == []
+
+    def test_the_languages_are_not_asked_for_where_every_config_is_there(self):
+        asked = []
+
+        def holds(language):
+            asked.append(language)
+            return True
+
+        assert cd.absent_config_findings(holds, {"go", "python", "markdown"}) == []
+        assert asked == []
+
+
+class TestStepFinding:
+    """A step compared against canon, with the keys a repository sets itself dropped."""
+
+    @staticmethod
+    def canon_step():
+        text = (Path(__file__).parent / "configs" / "shell" / "shellcheck-step.yml").read_text()
+        return yaml.safe_load(text)[0]
+
+    def test_a_matching_step_reports_nothing(self):
+        assert cd.step_finding(cd.SHELL_LOCAL, "ShellCheck step", self.canon_step(), self.canon_step()) is None
+
+    def test_a_repository_sets_its_own_scandir_and_ignore_paths(self):
+        theirs = self.canon_step()
+        theirs["with"]["scandir"] = "./scripts"
+        theirs["with"]["ignore_paths"] = "vendor"
+        assert cd.step_finding(cd.SHELL_LOCAL, "ShellCheck step", self.canon_step(), theirs) is None
+
+    def test_a_difference_in_a_shared_key_is_reported_against_the_label(self):
+        theirs = self.canon_step()
+        theirs["with"]["version"] = "v0.10.0"
+        label, diff = cd.step_finding(cd.SHELL_LOCAL, "ShellCheck step", self.canon_step(), theirs)
+        assert label == "ShellCheck step"
+        assert "v0.10.0" in diff
+
+    def test_a_gate_declaring_no_local_keys_compares_every_one_of_them(self):
+        canon = {"uses": "action", "with": {"globs": ""}}
+        theirs = {"uses": "action", "with": {"globs": "**/*.md"}}
+        assert cd.step_finding((), "markdownlint step", canon, theirs) is not None
+
+
+class TestWorkflowFindings:
+    """One workflow body: what it fails, and which canonical steps it carries."""
+
+    @staticmethod
+    def with_steps(steps):
+        return SOUND.replace(
+            "      - uses: actions/checkout@v7.0.1\n",
+            "      - uses: actions/checkout@v7.0.1\n" + steps + "\n",
+        )
+
+    def test_a_workflow_carrying_both_canonical_steps_reports_nothing(self):
+        found, stepped = cd.workflow_findings("test.yml", self.with_steps(CANONICAL_STEPS))
+        assert found == []
+        assert stepped == {"action-shellcheck", "markdownlint-cli2-action"}
+
+    def test_a_workflow_running_neither_gate_carries_neither(self):
+        found, stepped = cd.workflow_findings("test.yml", SOUND)
+        assert found == []
+        assert stepped == set()
+
+    def test_a_shape_complaint_names_the_workflow_it_is_in(self):
+        theirs = SOUND.replace("    timeout-minutes: 15\n", "")
+        found, _ = cd.workflow_findings("test.yml", theirs)
+        assert found == [("workflow shape (test.yml)", "job lint declares no timeout-minutes")]
+
+    def test_a_drifted_step_is_reported_while_still_counting_as_carried(self):
+        drifted = CANONICAL_STEPS.replace('globs: ""', 'globs: "**/*.md"')
+        found, stepped = cd.workflow_findings("test.yml", self.with_steps(drifted))
+        assert [label for label, _ in found] == ["markdownlint step (test.yml)"]
+        assert stepped == {"action-shellcheck", "markdownlint-cli2-action"}
+
+
+class TestAbsentStepFindings:
+    """A canonical step no workflow in the repository carries."""
+
+    def test_a_repository_holding_shell_with_no_step_is_reported(self):
+        assert cd.absent_step_findings(lambda _: True, "demo", {"markdownlint-cli2-action"}) == [
+            ("ShellCheck step", "no ShellCheck step in any workflow, and the repository holds shell")
+        ]
+
+    def test_a_repository_that_lints_shell_some_other_way_is_exempt(self):
+        exempt = next(iter(cd.SHELL_EXEMPT))
+        assert cd.absent_step_findings(lambda _: True, exempt, {"markdownlint-cli2-action"}) == []
+
+    def test_a_repository_github_reports_no_shell_for_needs_no_step(self):
+        assert cd.absent_step_findings(lambda _: False, "demo", {"markdownlint-cli2-action"}) == []
+
+    def test_the_markdownlint_step_is_expected_of_every_repository(self):
+        assert cd.absent_step_findings(lambda _: False, "demo", {"action-shellcheck"}) == [
+            ("markdownlint step", "no markdownlint step in any workflow, and every repository here holds Markdown")
+        ]
+
+
+CANONICAL_STEPS = (
+    (Path(__file__).parent / "configs" / "shell" / "shellcheck-step.yml").read_text().rstrip("\n")
+    + "\n"
+    + (Path(__file__).parent / "configs" / "markdown" / "markdownlint-step.yml").read_text().rstrip("\n")
+)
+
+
+def repository(files, languages=(), workflows=()):
+    """Stand-ins for the three calls check() makes to reach a repository.
+
+    Returns the patches to apply and the list the calls are recorded into, so a
+    test can assert what was asked for as well as what came back.
+    """
+    calls = []
+
+    def fetch(repo, path):
+        calls.append(path)
+        text = files.get(path)
+        return None if text is None else base64.b64encode(text.encode()).decode()
+
+    def holds_language(repo, language):
+        calls.append(f"languages/{language}")
+        return language in languages
+
+    def workflow_names(repo):
+        calls.append("workflows/")
+        return list(workflows)
+
+    return {"fetch": fetch, "holds_language": holds_language, "workflow_names": workflow_names}, calls
+
+
+class TestCheck:
+    """What one repository is asked for, and what comes back."""
+
+    @staticmethod
+    def run(monkeypatch, files, languages=(), workflows=(), repo="demo", uses=None):
+        patches, calls = repository(files, languages, workflows)
+        for name, value in patches.items():
+            monkeypatch.setattr(cd, name, value)
+        return cd.check(repo, uses), calls
+
+    def test_a_repository_with_none_of_it_is_asked_for_each_gate_in_turn(self, monkeypatch):
+        found, calls = self.run(monkeypatch, {})
+        assert found == [
+            (".markdownlint-cli2.yaml", "no markdownlint config, and every repository here holds Markdown"),
+            (".github/workflows/ai-attributions.yml", "no attributions workflow"),
+            (
+                "markdownlint step",
+                "no markdownlint step in any workflow, and every repository here holds Markdown",
+            ),
+        ]
+        assert calls == [
+            ".golangci.yml",
+            "ruff.toml",
+            ".markdownlint-cli2.yaml",
+            "languages/Go",
+            "languages/Python",
+            "eslint.config.base.mjs",
+            ".lintstagedrc",
+            "package.json",
+            ".husky/pre-commit",
+            "package.json",
+            ".github/workflows/ai-attributions.yml",
+            "workflows/",
+            "languages/Shell",
+        ]
+
+    def test_a_repository_matching_canon_reports_nothing_and_tallies_its_actions(self, monkeypatch):
+        canon = Path(__file__).parent / "configs"
+        uses = {}
+        found, calls = self.run(
+            monkeypatch,
+            {
+                ".markdownlint-cli2.yaml": (canon / "markdown" / "markdownlint-cli2.yaml").read_text(),
+                ".github/workflows/ai-attributions.yml": (canon / "attributions" / "ai-attributions.yml").read_text(),
+                ".github/workflows/test.yml": SOUND.replace(
+                    "      - uses: actions/checkout@v7.0.1\n",
+                    "      - uses: actions/checkout@v7.0.1\n" + CANONICAL_STEPS + "\n",
+                ),
+            },
+            languages=("Shell",),
+            workflows=("test.yml",),
+            uses=uses,
+        )
+        assert found == []
+        assert sorted(uses) == [
+            "DavidAnson/markdownlint-cli2-action",
+            "actions/checkout",
+            "ludeeus/action-shellcheck",
+        ]
+        # The shell lookup is never made: a workflow carrying the step answers it.
+        assert "languages/Shell" not in calls
+
+    def test_a_repository_that_drifted_and_a_gate_it_never_added_are_reported_in_order(self, monkeypatch):
+        canon = (Path(__file__).parent / "configs" / "markdown" / "markdownlint-cli2.yaml").read_text()
+        found, _ = self.run(
+            monkeypatch,
+            {".markdownlint-cli2.yaml": canon.replace("MD013: false", "MD013: true")},
+            languages=("Go",),
+        )
+        assert [label for label, _ in found] == [
+            ".markdownlint-cli2.yaml",
+            ".golangci.yml",
+            ".github/workflows/ai-attributions.yml",
+            "markdownlint step",
+        ]
+        assert "MD013" in found[0][1]
+        assert found[1][1] == "no go config, and GitHub reports Go"
+
+    def test_a_workflow_that_drifted_is_reported_against_its_own_name(self, monkeypatch):
+        drifted = SOUND.replace("permissions:\n  contents: read\n", "").replace(
+            "      - uses: actions/checkout@v7.0.1\n",
+            "      - uses: actions/checkout@v7.0.1\n" + CANONICAL_STEPS.replace('globs: ""', 'globs: "**/*.md"') + "\n",
+        )
+        found, _ = self.run(monkeypatch, {".github/workflows/build.yml": drifted}, workflows=("build.yml",))
+        labels = [label for label, _ in found]
+        assert "workflow shape (build.yml)" in labels
+        assert "markdownlint step (build.yml)" in labels
+
+    def test_a_workflow_listed_but_no_longer_there_is_skipped_rather_than_fatal(self, monkeypatch):
+        found, calls = self.run(monkeypatch, {}, workflows=("gone.yml",))
+        assert ".github/workflows/gone.yml" in calls
+        assert not any("gone.yml" in label for label, _ in found)

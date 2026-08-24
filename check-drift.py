@@ -436,12 +436,112 @@ def pinning(uses):
     return found
 
 
+def config_findings(loader, locals_, label, path, canon_text, repo_text):
+    """Every finding for one lint config a repository does carry."""
+    found = []
+    diff = compare_structured(label, canon_text, repo_text, loader, locals_)
+    if diff:
+        found.append((path, diff))
+    # The Markdown ignore list is not compared whole, so the entries canon names
+    # in it are asked for separately.
+    if label == "markdown":
+        missing = dropped_ignores(canon_text, repo_text)
+        if missing:
+            found.append((path, "ignores no longer names: " + ", ".join(missing)))
+    return found
+
+
+def absent_config_findings(holds, present):
+    """Findings for a lint config a repository is expected to carry and does not.
+
+    `holds` answers whether GitHub reports a language, and is asked only where a
+    config is missing, so a repository carrying both costs no languages call.
+    """
+    found = []
+    # Every repository here holds at least a README.md, so a missing Markdown
+    # config is a gate nobody added rather than one that does not apply.
+    if "markdown" not in present:
+        found.append((".markdownlint-cli2.yaml", "no markdownlint config, and every repository here holds Markdown"))
+    # Go and Python are skipped where the language is absent. A repository that
+    # holds the language and carries no config has a gate nobody added, which
+    # reads exactly like one every file passed.
+    for label, path, language in (("go", ".golangci.yml", "Go"), ("python", "ruff.toml", "Python")):
+        if label not in present and holds(language):
+            found.append((path, f"no {label} config, and GitHub reports {language}"))
+    return found
+
+
+def step_finding(drop, label, canon_step, theirs):
+    """A diff of one workflow step against canon, or None where they agree.
+
+    `drop` names the `with:` keys a repository sets itself, removed from both
+    sides first.
+    """
+    for key in drop:
+        (canon_step.get("with") or {}).pop(key, None)
+        (theirs.get("with") or {}).pop(key, None)
+    if canon_step == theirs:
+        return None
+    return (label, diff_trees(canon_step, theirs))
+
+
+# Each gate that is compared as a step rather than as a file: the action naming
+# it, the label a finding carries, the canonical step under configs/, and the
+# `with:` keys a repository sets itself.
+WORKFLOW_STEPS = (
+    ("action-shellcheck", "ShellCheck step", ("shell", "shellcheck-step.yml"), SHELL_LOCAL),
+    ("markdownlint-cli2-action", "markdownlint step", ("markdown", "markdownlint-step.yml"), ()),
+)
+
+
+def workflow_findings(name, text):
+    """Every finding in one workflow body, and which canonical steps it carries.
+
+    The steps carried are returned rather than their absence reported here: a
+    repository is asked for a step once across every workflow it has, not once
+    per file.
+    """
+    found = [(f"workflow shape ({name})", complaint) for complaint in workflow_shape(text)]
+    stepped = set()
+    for action, label, canon_path, drop in WORKFLOW_STEPS:
+        theirs = workflow_step(text, action)
+        if theirs is None:
+            continue
+        stepped.add(action)
+        canon_step = yaml.safe_load(CANON.joinpath(*canon_path).read_text())[0]
+        finding = step_finding(drop, f"{label} ({name})", canon_step, theirs)
+        if finding:
+            found.append(finding)
+    return found, stepped
+
+
+def absent_step_findings(holds, repo, stepped):
+    """Findings for a canonical step no workflow in the repository carries.
+
+    Comparing a step only where one exists says nothing about a repository that
+    holds shell and never added it, and that repository is the one worth hearing
+    about. SHELL_EXEMPT names the ones that lint shell some other way.
+    """
+    found = []
+    if "action-shellcheck" not in stepped and repo not in SHELL_EXEMPT and holds("Shell"):
+        found.append(("ShellCheck step", "no ShellCheck step in any workflow, and the repository holds shell"))
+    if "markdownlint-cli2-action" not in stepped:
+        found.append(
+            ("markdownlint step", "no markdownlint step in any workflow, and every repository here holds Markdown")
+        )
+    return found
+
+
 def check(repo, uses=None):
     """Every drifted artifact in one repository, as (label, diff) pairs.
 
     `uses` accumulates the action refs seen, for the cross-repository tally that
     one repository on its own cannot produce.
     """
+
+    def holds(language):
+        return holds_language(repo, language)
+
     found = []
 
     present = set()
@@ -455,29 +555,9 @@ def check(repo, uses=None):
             continue
         present.add(label)
         canon_text = (CANON / label / canon_name).read_text()
-        repo_text = decode(content)
-        diff = compare_structured(label, canon_text, repo_text, loader, locals_)
-        if diff:
-            found.append((path, diff))
-        if label == "markdown":
-            missing = dropped_ignores(canon_text, repo_text)
-            if missing:
-                found.append((path, "ignores no longer names: " + ", ".join(missing)))
+        found += config_findings(loader, locals_, label, path, canon_text, decode(content))
 
-    # Reported rather than skipped, on the same reasoning as the ShellCheck step
-    # below. Go and Python configs are skipped where the language is absent, but
-    # every repository here holds at least a README.md, so a missing Markdown
-    # config is a gate nobody added rather than one that does not apply.
-    if "markdown" not in present:
-        found.append((".markdownlint-cli2.yaml", "no markdownlint config, and every repository here holds Markdown"))
-
-    # Compared above only where the file exists, so absence needs asking about
-    # separately: a repository that holds the language and carries no config has
-    # a gate nobody added, which reads exactly like one every file passed. Same
-    # reasoning as the ShellCheck step below, and the same source for presence.
-    for label, path, language in (("go", ".golangci.yml", "Go"), ("python", "ruff.toml", "Python")):
-        if label not in present and holds_language(repo, language):
-            found.append((path, f"no {label} config, and GitHub reports {language}"))
+    found += absent_config_findings(holds, present)
 
     content = fetch(repo, "eslint.config.base.mjs")
     if content is not None:
@@ -493,9 +573,9 @@ def check(repo, uses=None):
         if canon != theirs:
             found.append((".lintstagedrc", diff_trees(canon, theirs)))
     elif fetch(repo, "package.json") is not None:
-        # Reported rather than skipped, on the reasoning the step checks below
-        # share: a repository that never added the hook reads exactly like one
-        # whose hook matched.
+        # Reported rather than skipped, on the reasoning the step checks share:
+        # a repository that never added the hook reads exactly like one whose
+        # hook matched.
         found.append((".lintstagedrc", "no lint-staged config, and the repository has a package.json"))
 
     content = fetch(repo, ".husky/pre-commit")
@@ -519,47 +599,20 @@ def check(repo, uses=None):
     else:
         found.append((".github/workflows/ai-attributions.yml", "no attributions workflow"))
 
-    stepped = False
-    md_stepped = False
+    stepped = set()
     for name in workflow_names(repo):
         content = fetch(repo, f".github/workflows/{name}")
         if content is None:
             continue
         text = decode(content)
-
-        found.extend((f"workflow shape ({name})", complaint) for complaint in workflow_shape(text))
+        rows, carried = workflow_findings(name, text)
+        found += rows
+        stepped |= carried
         if uses is not None:
             for action, version in actions_used(text):
                 uses.setdefault(action, {}).setdefault(version, []).append(repo)
 
-        theirs = workflow_step(text, "action-shellcheck")
-        if theirs is not None:
-            stepped = True
-            canon_step = yaml.safe_load((CANON / "shell" / "shellcheck-step.yml").read_text())[0]
-            for key in SHELL_LOCAL:
-                (canon_step.get("with") or {}).pop(key, None)
-                (theirs.get("with") or {}).pop(key, None)
-            if canon_step != theirs:
-                found.append((f"ShellCheck step ({name})", diff_trees(canon_step, theirs)))
-
-        theirs = workflow_step(text, "markdownlint-cli2-action")
-        if theirs is not None:
-            md_stepped = True
-            canon_step = yaml.safe_load((CANON / "markdown" / "markdownlint-step.yml").read_text())[0]
-            if canon_step != theirs:
-                found.append((f"markdownlint step ({name})", diff_trees(canon_step, theirs)))
-
-    # Reported rather than skipped. Comparing a step only where one exists says
-    # nothing about a repository that holds shell and never added the step, and
-    # that repository is the one worth hearing about. SHELL_EXEMPT names the
-    # ones that lint shell some other way or deliberately do not.
-    if not stepped and repo not in SHELL_EXEMPT and holds_language(repo, "Shell"):
-        found.append(("ShellCheck step", "no ShellCheck step in any workflow, and the repository holds shell"))
-
-    if not md_stepped:
-        found.append(
-            ("markdownlint step", "no markdownlint step in any workflow, and every repository here holds Markdown")
-        )
+    found += absent_step_findings(holds, repo, stepped)
 
     return found
 
