@@ -260,7 +260,11 @@ both. Exclude `event: dynamic` runs here: those are Dependabot's, covered below.
 
 Drop a path the tree no longer carries before taking the latest. Its runs are a
 deleted workflow's history, so a workflow removed while red reports as a failing
-gate that nothing runs any more.
+gate that nothing runs any more. Compare full paths: a run's `path` is
+`.github/workflows/ci.yml`, while `contents/.github/workflows --jq '.[].name'`
+yields the bare filename, so comparing the two matches nothing and drops every
+run. Key the drop on a listing that exited zero, so a failed query cannot drop
+every run and read as a repository with nothing failing.
 
 This reports the health of the default branch and nothing else. Tags need their own
 pass.
