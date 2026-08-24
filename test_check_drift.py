@@ -512,3 +512,100 @@ class TestUnreadableFiles:
 
     def test_a_gh_failure_is_not_swallowed_as_unreadable(self):
         assert not isinstance(cd.GhError("bad"), cd.UNREADABLE)
+
+
+def raising(error):
+    """A stand-in that raises rather than answering."""
+
+    def call(*args, **kwargs):
+        raise error
+
+    return call
+
+
+def checking(answers):
+    """A check() stand-in answering per repository; an exception value is raised instead."""
+
+    def check(repo, uses=None):
+        answer = answers[repo]
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    return check
+
+
+class TestMain:
+    """The exit code is the whole answer: 2 says the sweep did not finish, 1 says it found drift."""
+
+    @pytest.fixture(autouse=True)
+    def _sweep_every_repository(self, monkeypatch):
+        monkeypatch.setattr(cd.sys, "argv", ["check-drift.py"])
+
+    def test_a_sweep_that_cannot_start_exits_2_and_prints_nothing(self, monkeypatch, capsys):
+        monkeypatch.setattr(cd, "repositories", raising(cd.GhError("rate limited")))
+        assert cd.main() == 2
+        assert capsys.readouterr().out == ""
+
+    def test_a_sweep_that_fails_part_way_prints_none_of_what_it_found(self, monkeypatch, capsys):
+        monkeypatch.setattr(cd, "repositories", lambda: ["first", "second"])
+        monkeypatch.setattr(
+            cd,
+            "check",
+            checking({"first": [("ruff.toml", "drifted")], "second": cd.GhError("rate limited")}),
+        )
+        assert cd.main() == 2
+        assert capsys.readouterr().out == ""
+
+    def test_drift_exits_1_and_names_the_repository_it_is_in(self, monkeypatch, capsys):
+        monkeypatch.setattr(cd, "repositories", lambda: ["gog"])
+        monkeypatch.setattr(cd, "check", checking({"gog": [("ruff.toml", "drifted")]}))
+        assert cd.main() == 1
+        out = capsys.readouterr().out
+        assert "gog: ruff.toml" in out
+        assert "drifted" in out
+
+    def test_a_clean_sweep_exits_0_and_counts_what_it_read(self, monkeypatch, capsys):
+        monkeypatch.setattr(cd, "repositories", lambda: ["gog", "mrs"])
+        monkeypatch.setattr(cd, "check", checking({"gog": [], "mrs": []}))
+        assert cd.main() == 0
+        assert "2 repositories checked, no drift." in capsys.readouterr().out
+
+    def test_an_unreadable_file_is_one_repositorys_finding_and_the_sweep_goes_on(self, monkeypatch, capsys):
+        monkeypatch.setattr(cd, "repositories", lambda: ["broken", "sound"])
+        monkeypatch.setattr(
+            cd,
+            "check",
+            checking({"broken": yaml.YAMLError("bad"), "sound": [("ruff.toml", "drifted")]}),
+        )
+        assert cd.main() == 1
+        out = capsys.readouterr().out
+        assert "broken: unreadable file" in out
+        assert "YAMLError" in out
+        assert "sound: ruff.toml" in out
+
+    def test_the_cross_repository_tally_is_reported_even_where_no_repository_drifted(self, monkeypatch, capsys):
+        monkeypatch.setattr(cd, "repositories", lambda: ["gog", "mrs"])
+
+        def check(repo, uses=None):
+            uses.setdefault("some/action", {}).setdefault("main", []).append(repo)
+            return []
+
+        monkeypatch.setattr(cd, "check", check)
+        assert cd.main() == 1
+        out = capsys.readouterr().out
+        assert "some/action" in out
+        assert "not a release" in out
+
+    def test_one_repository_is_checked_without_asking_for_the_listing_or_the_tally(self, monkeypatch):
+        monkeypatch.setattr(cd.sys, "argv", ["check-drift.py", "--repo", "gog"])
+        monkeypatch.setattr(cd, "repositories", raising(AssertionError("the listing must not be asked for")))
+        seen = []
+
+        def check(repo, uses=None):
+            seen.append((repo, uses))
+            return []
+
+        monkeypatch.setattr(cd, "check", check)
+        assert cd.main() == 0
+        assert seen == [("gog", None)]
