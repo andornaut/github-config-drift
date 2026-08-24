@@ -32,7 +32,7 @@ Where the copies are meant to differ, they differ in named places:
 | Language | Per-repository, by design |
 | --- | --- |
 | Go | the `gci` import prefix, the `gosec` suppression list, exclusion rules a repository states are local |
-| Python | `per-file-ignores`, `extend-include`, `extend-exclude`, and `target-version` where a repository states a floor |
+| Python | `per-file-ignores`, `extend-include`, `extend-exclude`, `builtins` where a sandbox injects names, and `target-version` where a repository states a floor |
 | JavaScript | the eslint entries in `.lintstagedrc`, which name the script types a repository holds; `eslint.config.base.mjs` is byte-identical everywhere, and each repository's own `eslint.config.mjs` applies it to its paths |
 | Shell | `scandir` and `ignore_paths`, which name a repository's own vendored trees |
 | Markdown | `ignores`, where a repository adds its own test data to the shared entries. Additions only: an entry canon names and a copy does not is reported |
@@ -46,7 +46,8 @@ them holds, out of the body already fetched to compare the steps, so these cost 
 further calls:
 
 - every job declares `timeout-minutes`, since without one a hung job runs to the
-  six-hour default while holding a runner and telling nobody
+  six-hour default while holding a runner and telling nobody. A job that calls
+  another workflow is exempt: the jobs in that workflow carry their own
 - a file declaring `timeout-minutes` carries the rationale comment once, so the next
   reader has a reason for the number
 - every workflow declares a top-level `permissions:` block rather than taking the
@@ -113,8 +114,9 @@ python3 check-drift.py            # report, exit 1 on drift, 2 if it could not f
 python3 check-drift.py --repo gog # one repository
 ```
 
-It reads each file through `gh api`, so it needs `gh` authenticated. CI runs it
-weekly on Mondays and on any change to `configs/` or the script.
+It reads each file through `gh api`, so it needs `gh` authenticated. The `Drift`
+workflow runs it on Mondays at 07:00 UTC, and on a push to `main` touching
+`configs/`, the script, or the workflow itself.
 
 ## Developing
 

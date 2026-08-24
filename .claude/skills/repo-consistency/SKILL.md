@@ -66,10 +66,10 @@ The rulesets **list** endpoint returns only id/name; rules require the per-id fe
 
 ### A zero is not an answer
 
-Every false finding this audit has produced came from a valid-shaped short result
-read as the whole answer: an empty one taken for a real zero, or a truncated one
-taken for a real count. Before reporting that something is missing or that a set is
-smaller than canon says, establish that the query could have found the rest.
+A valid-shaped short result read as the whole answer is what produces a false
+finding here: an empty one taken for a real zero, or a truncated one taken for a
+real count. Before reporting that something is missing or that a set is smaller
+than canon says, establish that the query could have found the rest.
 
 - Backgrounded `gh` calls fail silently under load. After fetching, assert every
   expected output file exists and is non-empty, and refetch the gaps. Do the
@@ -308,7 +308,7 @@ Exchange `/a/NNN` short permalink expanding to its question, or `discord.gg` bec
 `discord.com/invite` is normal behaviour and not drift. A deep page that lands on a
 docs root has lost the content, so following it makes the link worse.
 
-Two ways this check lies, both of which have produced wrong calls here:
+Two ways this check lies:
 
 - A status is about the client as much as the page. Stack Exchange, Fandom, O'Reilly
   and GitLab answer a scripted request with 403, freedesktop.org with 418, and a host
@@ -342,8 +342,13 @@ adding required status checks, enabling scan flags, renaming a repo. Present the
 peer groups that already exist so the choice is "match this group" rather than an
 open design question.
 
-Prefer landing a deviant file byte-identical to the canonical version, and verify
-with `diff` against `configs/` in this repository.
+Land a deviant file as close to the canonical version as its comparison allows.
+`eslint.config.base.mjs`, `.husky/pre-commit` and the attributions workflow are compared
+byte for byte, so `diff` against `configs/` in this repository is the check.
+`.golangci.yml`, `ruff.toml` and `.markdownlint-cli2.yaml` are compared with the
+declared-local keys stripped, so `diff` reports differences that are allowed: run
+`check-drift.py --repo` against the repository instead of reading that diff as
+drift.
 
 ## Editing rulesets
 
