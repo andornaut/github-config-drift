@@ -21,8 +21,11 @@ on:
 permissions:
   contents: read
 
-# One at a time. A scheduled run and a push that lands while it is going would
-# otherwise report the same drift twice.
+# One run at a time per event and branch. Spelled the same as every other
+# workflow's group. Keyed by the event, so a scheduled sweep and a push to main
+# do not cancel each other: a push landing while the week's scheduled run is
+# going would otherwise drop it, and the same drift reported twice costs less
+# than a sweep that never happened.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
