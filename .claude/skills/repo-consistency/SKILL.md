@@ -29,6 +29,14 @@ Read its exit status, not only its last line: 0 is a clean sweep, 1 is drift, an
 is a sweep that could not be completed and is reporting nothing. Treat 2 as unknown
 rather than clean, and re-run it before relying on any of the file-drift layer.
 
+## What this file may record
+
+Record the lookup, not its answer. A version number, a count, or a repository's
+current state written down here is wrong by the next release, and a stale audit
+guide reports drift that is not there. Name the command that derives the fact
+instead. Illustrating a shape is fine (`3.12` is a minor, `v24.13.1` is a patch);
+asserting current state is not.
+
 ## Scope
 
 Audit repositories owned by the operator, excluding:
@@ -196,11 +204,19 @@ curl -sS https://endoflife.date/api/ruby.json \
 This reads a support window, so it applies to a runtime that has one: Ruby, Node,
 Python and Go all keep several lines alive at once and retire the oldest on a date.
 A rapid-release language does not, and endoflife.date marks every version but the
-newest as past `eol` for those, which is not a finding. Rust is the one here: the
-`rust-version` in `Cargo.toml` and the toolchain the floor job pins to it are a
-minimum a consumer must have, not the runtime CI installs, and sitting a release or
-two behind stable is what a floor is for. filectrl declares 1.97 against a 1.98
-stable deliberately, and the jobs that matter run `@stable`.
+newest as past `eol` for those, which is not a finding. Rust is the one to expect:
+the `rust-version` in `Cargo.toml` and the toolchain a job pins to that same number
+are a minimum a consumer must have, not the runtime CI installs, and sitting a
+release or two behind stable is what a floor is for. Read a declared floor against
+the refs beside it rather than against whatever stable is that week:
+
+```bash
+gh api "repos/$r/contents/Cargo.toml" --jq .content | base64 -d | grep rust-version
+gh api "repos/$r/contents/.github/workflows" --jq '.[].name' | while read -r f; do
+  gh api "repos/$r/contents/.github/workflows/$f" --jq .content | base64 -d \
+    | grep -n 'rust-toolchain@' | sed "s|^|$f: |"
+done
+```
 
 A pin naming a minor (`3.12`) takes the newest patch on every run; one naming a
 patch (`v24.13.1`, `3.2.2`) freezes until someone edits it, so those are the ones
