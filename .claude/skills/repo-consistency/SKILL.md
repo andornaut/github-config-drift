@@ -190,10 +190,8 @@ nothing about whether the release waited for it. A release job must reach its ch
 through `uses: ./.github/workflows/x.yml` plus `needs:`, not run alongside them.
 
 A release workflow that runs no jobs on a push to the default branch is not a gap
-by itself. Whether a rolling `dev` release is possible depends on the package
-format: an asset renamed to drop its version is replaced by each upload, and one
-whose filename must carry the version accumulates instead, since an upload
-replaces only a file it can match by name. Read the comment beside the job before
+by itself: a rolling `dev` release needs an asset name that can drop its version,
+which not every package format allows. Read the comment beside the job before
 calling that absence drift.
 
 ### Runtime pins against upstream support
