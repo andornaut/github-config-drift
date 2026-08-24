@@ -189,10 +189,9 @@ Workflows do not wait on each other. A green scan running *beside* a release say
 nothing about whether the release waited for it. A release job must reach its checks
 through `uses: ./.github/workflows/x.yml` plus `needs:`, not run alongside them.
 
-A release workflow that runs no jobs on a push to the default branch is not a gap
+A release workflow that runs no jobs on a push to the default branch is not drift
 by itself: a rolling `dev` release needs an asset name that can drop its version,
-which not every package format allows. Read the comment beside the job before
-calling that absence drift.
+which not every package format allows. Read the comment beside the job.
 
 ### Runtime pins against upstream support
 
