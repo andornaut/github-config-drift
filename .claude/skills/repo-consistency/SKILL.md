@@ -258,6 +258,10 @@ grouping by name splits one workflow's history the moment that key is added or
 changed and surfaces a superseded failure as current. The `path` is stable across
 both. Exclude `event: dynamic` runs here: those are Dependabot's, covered below.
 
+Drop a path the tree no longer carries before taking the latest. Its runs are a
+deleted workflow's history, so a workflow removed while red reports as a failing
+gate that nothing runs any more.
+
 This reports the health of the default branch and nothing else. Tags need their own
 pass.
 
