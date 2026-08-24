@@ -72,6 +72,141 @@ class TestDroppedIgnores:
         ]
 
 
+class TestStrip:
+    """The keys a repository may set locally are dropped before the comparison."""
+
+    @pytest.mark.parametrize(
+        ("tree", "paths", "expected"),
+        [
+            pytest.param(
+                {"target-version": "py312", "line-length": 120},
+                (("target-version",),),
+                {"line-length": 120},
+                id="a-top-level-key-is-dropped",
+            ),
+            pytest.param(
+                {"lint": {"per-file-ignores": {"a.py": ["S101"]}, "select": ["E"]}},
+                (("lint", "per-file-ignores"),),
+                {"lint": {"select": ["E"]}},
+                id="a-nested-key-is-dropped",
+            ),
+            pytest.param(
+                {"lint": {"select": ["E"]}},
+                (("format", "quote-style"),),
+                {"lint": {"select": ["E"]}},
+                id="a-path-whose-parent-is-absent-changes-nothing",
+            ),
+            pytest.param(
+                {"lint": {"select": ["E"]}},
+                (("lint", "per-file-ignores"),),
+                {"lint": {"select": ["E"]}},
+                id="a-path-whose-last-key-is-absent-changes-nothing",
+            ),
+            pytest.param(
+                {"lint": ["E"]},
+                (("lint", "per-file-ignores"),),
+                {"lint": ["E"]},
+                id="a-parent-that-is-not-a-mapping-changes-nothing",
+            ),
+            pytest.param(
+                {"linters": {"settings": ["gosec"]}},
+                (("linters", "settings", "gosec", "excludes"),),
+                {"linters": {"settings": ["gosec"]}},
+                id="a-parent-part-way-down-a-deep-path-that-is-not-a-mapping-changes-nothing",
+            ),
+        ],
+    )
+    def test_only_the_declared_local_keys_are_dropped(self, tree, paths, expected):
+        assert cd.strip(tree, paths) == expected
+
+
+class TestPrettierEntries:
+    """The prettier entry is shared; the eslint entries name a repository's own types."""
+
+    @pytest.mark.parametrize(
+        ("tree", "expected"),
+        [
+            pytest.param(
+                {"*": "prettier --write --ignore-unknown", "*.{js,ts}": "eslint --fix"},
+                {"*": "prettier --write --ignore-unknown"},
+                id="an-eslint-entry-is-the-repositorys-own",
+            ),
+            pytest.param(
+                {"*.{js,ts}": ["eslint --fix", "prettier --write"]},
+                {"*.{js,ts}": ["eslint --fix", "prettier --write"]},
+                id="a-command-list-is-read-for-prettier-too",
+            ),
+            pytest.param(
+                {"*.{js,ts}": "eslint --fix"},
+                {},
+                id="a-hook-that-never-runs-prettier-shares-nothing",
+            ),
+        ],
+    )
+    def test_only_the_entries_running_prettier_are_compared(self, tree, expected):
+        assert cd.prettier_entries(tree) == expected
+
+
+class TestLocalRules:
+    """A govet or tparallel exclusion is a repository's own; every other rule is compared."""
+
+    def test_the_rules_a_repository_marks_as_its_own_are_dropped(self):
+        tree = {
+            "linters": {
+                "exclusions": {
+                    "rules": [
+                        {"linters": ["govet"], "path": "x.go"},
+                        {"linters": ["tparallel"], "path": "y.go"},
+                        {"linters": ["errcheck"], "path": "z.go"},
+                        {"path": "w.go"},
+                    ]
+                }
+            }
+        }
+        assert cd.local_rules(tree)["linters"]["exclusions"]["rules"] == [
+            {"linters": ["errcheck"], "path": "z.go"},
+            {"path": "w.go"},
+        ]
+
+    def test_a_config_declaring_no_exclusions_is_left_alone(self):
+        assert cd.local_rules({"linters": {"enable": ["govet"]}}) == {"linters": {"enable": ["govet"]}}
+
+
+GO_RULE = "linters:\n  exclusions:\n    rules:\n      - linters: [govet]\n        path: x.go\n"
+NO_GO_RULES = "linters:\n  exclusions:\n    rules: []\n"
+
+
+class TestCompareStructured:
+    """What counts as a difference, and what a repository is allowed to set itself."""
+
+    def test_matching_configs_report_nothing(self):
+        text = '[lint]\nselect = ["E"]\n'
+        assert cd.compare_structured("python", text, text, tomllib.loads, cd.PYTHON_LOCAL) is None
+
+    def test_a_difference_confined_to_a_local_key_is_not_drift(self):
+        canon = '[lint]\nselect = ["E"]\n\n[lint.per-file-ignores]\n"a.py" = ["S101"]\n'
+        theirs = '[lint]\nselect = ["E"]\n\n[lint.per-file-ignores]\n"b.py" = ["T201"]\n'
+        assert cd.compare_structured("python", canon, theirs, tomllib.loads, cd.PYTHON_LOCAL) is None
+
+    def test_a_difference_in_a_shared_key_is_reported_as_a_diff(self):
+        diff = cd.compare_structured(
+            "python",
+            '[lint]\nselect = ["E"]\n',
+            '[lint]\nselect = ["E", "F"]\n',
+            tomllib.loads,
+            cd.PYTHON_LOCAL,
+        )
+        assert "--- canon" in diff
+        assert "+++ repository" in diff
+        assert "+  - F" in diff
+
+    def test_a_go_rule_a_repository_marks_as_its_own_is_not_drift(self):
+        assert cd.compare_structured("go", NO_GO_RULES, GO_RULE, yaml.safe_load, cd.GO_LOCAL) is None
+
+    def test_the_same_rule_is_drift_where_the_language_is_not_go(self):
+        assert cd.compare_structured("markdown", NO_GO_RULES, GO_RULE, yaml.safe_load, cd.MARKDOWN_LOCAL) is not None
+
+
 @pytest.fixture(autouse=True)
 def _forget_answers():
     """gh() reuses an answer for the life of a run, and each test is its own run."""
@@ -233,6 +368,40 @@ class TestWorkflowShape:
     def test_faramirs_slower_suite_still_counts_as_a_rationale(self):
         theirs = SOUND.replace("six minutes", "eight minutes")
         assert cd.workflow_shape(theirs) == []
+
+
+STEPPED = """
+name: Test
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: ludeeus/action-shellcheck@2.0.0
+        with:
+          severity: error
+  build:
+    runs-on: ubuntu-latest
+"""
+
+
+class TestWorkflowStep:
+    """The step running an action, found wherever in the file it was put."""
+
+    def test_the_step_is_returned_whole(self):
+        assert cd.workflow_step(STEPPED, "action-shellcheck") == {
+            "uses": "ludeeus/action-shellcheck@2.0.0",
+            "with": {"severity": "error"},
+        }
+
+    def test_an_action_no_job_runs_is_absent(self):
+        assert cd.workflow_step(STEPPED, "markdownlint-cli2-action") is None
+
+    def test_a_workflow_declaring_no_jobs_is_absent(self):
+        assert cd.workflow_step("name: Test\n", "action-shellcheck") is None
+
+    def test_a_document_that_is_not_a_mapping_is_absent(self):
+        assert cd.workflow_step("just a string", "action-shellcheck") is None
 
 
 class TestPinning:
