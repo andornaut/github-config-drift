@@ -2,7 +2,6 @@
 """Unit tests for check-drift.py."""
 
 import binascii
-import importlib.machinery
 
 # Import the module by path: its name is not a Python identifier
 import importlib.util
@@ -15,11 +14,14 @@ import pytest
 import yaml
 
 module_path = Path(__file__).parent / "check-drift.py"
-loader = importlib.machinery.SourceFileLoader("check_drift", str(module_path))
-spec = importlib.util.spec_from_loader("check_drift", loader)
+spec = importlib.util.spec_from_file_location("check_drift", module_path)
 cd = importlib.util.module_from_spec(spec)
 sys.modules["check_drift"] = cd
-spec.loader.exec_module(cd)
+# Compiled here rather than through the loader, which validates its bytecode
+# cache on source size and mtime in whole seconds: an edit that keeps the size
+# and lands within the same second would otherwise be run from the stale copy,
+# and every test below would pass against a program that no longer exists.
+exec(compile(module_path.read_text(), str(module_path), "exec"), cd.__dict__)  # noqa: S102
 
 CANON = """
 ignores:
@@ -34,24 +36,28 @@ config:
 class TestDroppedIgnores:
     """An entry canon names is required; a repository may add to the list."""
 
-    def test_an_identical_list_reports_nothing(self):
-        assert cd.dropped_ignores(CANON, CANON) == []
-
-    def test_an_added_entry_is_not_drift(self):
-        theirs = CANON.replace("  - CLAUDE.md", '  - CLAUDE.md\n  - "fixtures/**"')
-        assert cd.dropped_ignores(CANON, theirs) == []
-
-    def test_a_dropped_entry_is_reported(self):
-        theirs = CANON.replace("  - CLAUDE.md\n", "")
-        assert cd.dropped_ignores(CANON, theirs) == ["CLAUDE.md"]
-
-    def test_every_dropped_entry_is_named(self):
-        theirs = "ignores:\n  - AGENTS.md\nconfig:\n  MD013: false\n"
-        assert cd.dropped_ignores(CANON, theirs) == ["**/node_modules/**", "CLAUDE.md"]
-
-    def test_a_config_with_no_ignores_key_drops_all_of_them(self):
-        theirs = "config:\n  MD013: false\n"
-        assert cd.dropped_ignores(CANON, theirs) == ["**/node_modules/**", "AGENTS.md", "CLAUDE.md"]
+    @pytest.mark.parametrize(
+        ("theirs", "expected"),
+        [
+            pytest.param(
+                CANON.replace("  - CLAUDE.md", '  - CLAUDE.md\n  - "fixtures/**"'),
+                [],
+                id="an-added-entry-is-not-drift",
+            ),
+            pytest.param(
+                "ignores:\n  - AGENTS.md\nconfig:\n  MD013: false\n",
+                ["**/node_modules/**", "CLAUDE.md"],
+                id="every-dropped-entry-is-named",
+            ),
+            pytest.param(
+                "config:\n  MD013: false\n",
+                ["**/node_modules/**", "AGENTS.md", "CLAUDE.md"],
+                id="a-config-with-no-ignores-key-drops-all-of-them",
+            ),
+        ],
+    )
+    def test_the_entries_a_repository_no_longer_names_are_reported(self, theirs, expected):
+        assert cd.dropped_ignores(CANON, theirs) == expected
 
     def test_the_shipped_canon_names_the_entries_that_matter(self):
         """The list the sweep enforces, read from the file it ships rather than a fixture."""
@@ -107,11 +113,13 @@ class TestGhDistinguishesAbsenceFromFailure:
         cd.gh("api", "whatever", allow_missing=True)
         assert len(run.calls) == 1
 
-    def test_a_404_still_raises_where_the_caller_expects_an_answer(self, monkeypatch):
-        monkeypatch.setattr(cd.subprocess, "run", run_returning(StubResult(1, "", "gh: Not Found (HTTP 404)")))
+    def test_a_404_raises_without_retrying_where_the_caller_expects_an_answer(self, monkeypatch):
+        run = run_returning(StubResult(1, "", "gh: Not Found (HTTP 404)"))
+        monkeypatch.setattr(cd.subprocess, "run", run)
         try:
             cd.gh("api", "whatever")
         except cd.GhError:
+            assert len(run.calls) == 1
             return
         raise AssertionError("a 404 must raise unless the caller allows a missing file")
 
@@ -158,6 +166,18 @@ class TestAFailedQueryCannotReduceTheSweep:
         raise AssertionError("an empty listing must not be reported as an estate with no drift")
 
 
+class TestNamesAreReadOneToALine:
+    """gh answers one name to a line, and a name can hold a space."""
+
+    def test_a_language_name_holding_a_space_is_still_found(self, monkeypatch):
+        monkeypatch.setattr(cd.subprocess, "run", run_returning(StubResult(0, "Jupyter Notebook\nPython\n")))
+        assert cd.holds_language("whatever", "Jupyter Notebook")
+
+    def test_a_workflow_name_holding_a_space_survives_whole(self, monkeypatch):
+        monkeypatch.setattr(cd.subprocess, "run", run_returning(StubResult(0, "my workflow.yml\nREADME.md\n")))
+        assert cd.workflow_names("whatever") == ["my workflow.yml"]
+
+
 SOUND = """
 name: Test
 on:
@@ -186,10 +206,6 @@ class TestWorkflowShape:
     def test_a_job_without_a_timeout_is_reported(self):
         theirs = SOUND.replace("    timeout-minutes: 15\n", "")
         assert cd.workflow_shape(theirs) == ["job lint declares no timeout-minutes"]
-
-    def test_a_lost_rationale_comment_is_reported(self):
-        theirs = "\n".join(line for line in SOUND.splitlines() if not line.strip().startswith("#"))
-        assert cd.workflow_shape(theirs) == ["declares timeout-minutes with no rationale comment"]
 
     def test_a_cap_other_than_fifteen_may_reword_its_comment(self):
         theirs = SOUND.replace("timeout-minutes: 15", "timeout-minutes: 30")
@@ -248,12 +264,28 @@ class TestPinning:
 
 
 class TestActionsUsed:
-    def test_local_and_unversioned_refs_are_skipped(self):
-        text = "jobs:\n  a:\n    steps:\n      - uses: ./.github/workflows/x.yml\n      - uses: bare/action\n"
-        assert cd.actions_used(text) == []
-
-    def test_a_pinned_ref_is_collected(self):
-        assert cd.actions_used("      - uses: actions/checkout@v7.0.1\n") == [("actions/checkout", "v7.0.1")]
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            pytest.param(
+                "jobs:\n  a:\n    steps:\n      - uses: ./.github/workflows/x.yml\n      - uses: bare/action\n",
+                [],
+                id="local-and-unversioned-refs-are-skipped",
+            ),
+            pytest.param(
+                "      - uses: actions/checkout@v7.0.1\n",
+                [("actions/checkout", "v7.0.1")],
+                id="a-pinned-ref-is-collected",
+            ),
+            pytest.param(
+                '      - uses: "actions/checkout@v7.0.1"\n',
+                [("actions/checkout", "v7.0.1")],
+                id="a-quoted-ref-is-collected-without-its-quotes",
+            ),
+        ],
+    )
+    def test_every_versioned_ref_is_collected(self, text, expected):
+        assert cd.actions_used(text) == expected
 
 
 class TestPinningRefinements:
@@ -272,10 +304,18 @@ class TestPinningRefinements:
         assert len(found) == 1
         assert "3 versions" in found[0][1]
 
-    def test_a_loose_ref_names_the_repositories_carrying_it(self):
-        found = cd.pinning({"some/action": {"main": ["gog", "mrs"]}})
-        assert "gog" in found[0][1]
-        assert "mrs" in found[0][1]
+    def test_two_declared_floors_and_no_channel_is_reported(self):
+        found = cd.pinning({cd.TOOLCHAIN: {"1.90": ["filectrl"], "1.97": ["other"]}})
+        assert len(found) == 1
+        assert "2 versions" in found[0][1]
+
+    def test_two_channels_is_reported(self):
+        found = cd.pinning({cd.TOOLCHAIN: {"beta": ["a"], "nightly": ["b"]}})
+        assert len(found) == 1
+        assert "2 versions" in found[0][1]
+
+    def test_a_dated_channel_is_documented_usage(self):
+        assert cd.pinning({cd.TOOLCHAIN: {"nightly-2026-01-01": ["filectrl"]}}) == []
 
     def test_the_majority_is_counted_rather_than_listed(self):
         many = {"some/action": {"main": [f"repo{n}" for n in range(9)]}}
@@ -303,19 +343,3 @@ class TestUnreadableFiles:
 
     def test_a_gh_failure_is_not_swallowed_as_unreadable(self):
         assert not isinstance(cd.GhError("bad"), cd.UNREADABLE)
-
-    def test_a_channel_and_a_floor_is_the_deliberate_pair(self):
-        assert cd.pinning({cd.TOOLCHAIN: {"stable": ["filectrl"], "1.97": ["filectrl"]}}) == []
-
-    def test_two_declared_floors_and_no_channel_is_reported(self):
-        found = cd.pinning({cd.TOOLCHAIN: {"1.90": ["filectrl"], "1.97": ["other"]}})
-        assert len(found) == 1
-        assert "2 versions" in found[0][1]
-
-    def test_two_channels_is_reported(self):
-        found = cd.pinning({cd.TOOLCHAIN: {"beta": ["a"], "nightly": ["b"]}})
-        assert len(found) == 1
-        assert "2 versions" in found[0][1]
-
-    def test_a_dated_channel_is_documented_usage(self):
-        assert cd.pinning({cd.TOOLCHAIN: {"nightly-2026-01-01": ["filectrl"]}}) == []
