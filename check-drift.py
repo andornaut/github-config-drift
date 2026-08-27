@@ -620,6 +620,13 @@ def check(repo, uses=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", help="check one repository rather than all of them")
+    parser.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="REPO",
+        help="drop a repository from the listing, repeatable. --repo names one outright and is not filtered",
+    )
     args = parser.parse_args()
 
     # The whole sweep, not each repository: a failure part way through leaves the
@@ -629,7 +636,19 @@ def main():
     # repositories after the failure are unread, and a reader has no way to tell
     # which half is missing.
     try:
-        names = [args.repo] if args.repo else repositories()
+        if args.repo:
+            # A repository named outright is read whatever --exclude says: the
+            # exclusions describe the estate sweep, and naming one is a request
+            # to look at it.
+            names = [args.repo]
+        else:
+            excluded = set(args.exclude)
+            names = [name for name in repositories() if name not in excluded]
+            # On stderr rather than dropped quietly: the count printed at the end
+            # says how many repositories were read, and a reader who cannot see
+            # what was left out reads it as the whole estate.
+            for name in sorted(excluded):
+                print(f"excluded: {name}", file=sys.stderr)
         # The action tally only says something across the estate: one repository
         # cannot show that another follows the same action at a different version,
         # so --repo collects nothing and reports nothing.

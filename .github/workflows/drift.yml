@@ -70,6 +70,11 @@ jobs:
       # not finish, but it can also die without choosing a code at all, on a
       # signal or an exception it does not catch, and 127 when python is missing.
       # Calling any of those drift would put back the conflation this replaced.
+      #
+      # andornaut/andornaut is excluded: it is the profile README GitHub renders
+      # on the user page rather than a software project. It runs no CI, so the
+      # gates canon describes have nothing to gate, and the badges every README
+      # here carries do not belong on a profile page.
       - name: Check for drift
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -80,7 +85,7 @@ jobs:
         # to work out that `$?` survived the list.
         run: |
           status=0
-          python3 check-drift.py || status=$?
+          python3 check-drift.py --exclude andornaut || status=$?
           if [ "$status" -eq 0 ]; then
             exit 0
           fi

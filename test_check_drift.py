@@ -598,6 +598,34 @@ class TestMain:
         assert "some/action" in out
         assert "not a release" in out
 
+    def test_an_excluded_repository_is_left_out_of_the_sweep_and_named_on_stderr(self, monkeypatch, capsys):
+        monkeypatch.setattr(cd.sys, "argv", ["check-drift.py", "--exclude", "andornaut"])
+        monkeypatch.setattr(cd, "repositories", lambda: ["andornaut", "gog"])
+        seen = []
+
+        def check(repo, uses=None):
+            seen.append(repo)
+            return [("ruff.toml", "drifted")]
+
+        monkeypatch.setattr(cd, "check", check)
+        assert cd.main() == 1
+        assert seen == ["gog"]
+        captured = capsys.readouterr()
+        assert "excluded: andornaut" in captured.err
+        assert "andornaut" not in captured.out
+
+    def test_a_repository_named_outright_is_read_though_it_is_excluded(self, monkeypatch):
+        monkeypatch.setattr(cd.sys, "argv", ["check-drift.py", "--repo", "andornaut", "--exclude", "andornaut"])
+        seen = []
+
+        def check(repo, uses=None):
+            seen.append(repo)
+            return []
+
+        monkeypatch.setattr(cd, "check", check)
+        assert cd.main() == 0
+        assert seen == ["andornaut"]
+
     def test_one_repository_is_checked_without_asking_for_the_listing_or_the_tally(self, monkeypatch):
         monkeypatch.setattr(cd.sys, "argv", ["check-drift.py", "--repo", "gog"])
         monkeypatch.setattr(cd, "repositories", raising(AssertionError("the listing must not be asked for")))
