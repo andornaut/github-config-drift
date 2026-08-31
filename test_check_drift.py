@@ -60,6 +60,38 @@ class TestDroppedIgnores:
     def test_the_entries_a_repository_no_longer_names_are_reported(self, theirs, expected):
         assert cd.dropped_ignores(CANON, theirs) == expected
 
+    @pytest.mark.parametrize(
+        ("entries", "expected"),
+        [
+            pytest.param(['".claude/**"'], [], id="the-canonical-spelling-satisfies-it"),
+            pytest.param(
+                ['".claude/*"', '".claude/!(skills)/**"'],
+                [],
+                id="the-skills-pair-satisfies-it",
+            ),
+            pytest.param(
+                ['".claude/*"'],
+                [".claude/**"],
+                id="half-the-pair-does-not-satisfy-it",
+            ),
+            pytest.param(
+                ['".claude/!(skills)/**"'],
+                [".claude/**"],
+                id="the-other-half-does-not-either",
+            ),
+            pytest.param([], [".claude/**"], id="naming-neither-is-reported-under-canon"),
+        ],
+    )
+    def test_an_entry_with_alternatives_takes_any_whole_spelling(self, entries, expected):
+        """The agent directory is ignored whole, or all but the skills, and canon names the first.
+
+        A repository committing its skills wants them linted, so the pair is not
+        drift. Half the pair is: it leaves every other subdirectory linted.
+        """
+        canon = 'ignores:\n  - ".claude/**"\n'
+        theirs = "ignores:\n" + "".join(f"  - {e}\n" for e in entries) if entries else "config: {}"
+        assert cd.dropped_ignores(canon, theirs) == expected
+
     def test_the_shipped_canon_names_the_entries_that_matter(self):
         """The list the sweep enforces, read from the file it ships rather than a fixture."""
         canon = (Path(__file__).parent / "configs" / "markdown" / "markdownlint-cli2.yaml").read_text()

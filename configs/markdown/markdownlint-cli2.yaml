@@ -26,6 +26,19 @@ globs:
 # gitignore rather than by a repository's own, and gitignore above reads only
 # the ones in the tree. So CI, which checks out tracked files, never sees them,
 # while a working copy holds them and would report findings the gate cannot.
+#
+# A repository that commits its agent skills re-includes them in its own
+# .gitignore, so CI does check them out and the gate should read them. It swaps
+# the ".claude/**" line below for the pair
+#
+#   - ".claude/*"
+#   - ".claude/!(skills)/**"
+#
+# which ignores the loose files and every subdirectory except skills/. The
+# sweep accepts either spelling, but only whole: ".claude/*" on its own leaves
+# every subdirectory linted. An entry is negated and handed to micromatch, so
+# the extglob does the excepting; a leading "!" here would arrive as "!!" and
+# re-include rather than exclude.
 ignores:
   - "**/node_modules/**"
   - ".agents/**"

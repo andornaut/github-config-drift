@@ -51,6 +51,21 @@ SHELL_LOCAL = ("scandir", "ignore_paths")
 # dropped_ignores below reports an entry that went missing. The step takes no
 # per-repository input, so it is compared whole.
 MARKDOWN_LOCAL = (("ignores",),)
+# One canon ignore entry, more than one acceptable spelling. A repository that
+# commits its agent skills re-includes them in .gitignore, so CI's checkout has
+# them and the Markdown gate should read them; the pair below ignores everything
+# else under the directory, which is the half that is still local-only. Canon
+# names the whole tree, which is right for a repository that commits none of it.
+#
+# Each alternative is a set, and all of it has to be present: the second entry
+# is what excludes the subdirectories, so a copy naming only ".claude/*" would
+# leave every one of them being linted rather than just the skills.
+IGNORE_ALTERNATIVES = {
+    ".claude/**": (
+        {".claude/**"},
+        {".claude/*", ".claude/!(skills)/**"},
+    ),
+}
 
 # The half of the rationale comment that holds whatever the cap is: faramir says
 # "eight minutes" where the rest say "six", so the sentinel cannot name a
@@ -229,10 +244,14 @@ def dropped_ignores(canon_text, repo_text):
     run from walking a dependency tree that CI's checkout does not have, and the
     agent instruction files are local-only, so a copy that stops naming them
     starts linting files that are not in the repository.
+
+    An entry IGNORE_ALTERNATIVES names is satisfied by any one of its spellings,
+    and is reported under the canonical one so the finding still says what to go
+    and add.
     """
     canon = yaml.safe_load(canon_text).get("ignores") or []
     theirs = set(yaml.safe_load(repo_text).get("ignores") or [])
-    return [entry for entry in canon if entry not in theirs]
+    return [entry for entry in canon if not any(form <= theirs for form in IGNORE_ALTERNATIVES.get(entry, ({entry},)))]
 
 
 def local_rules(tree):
