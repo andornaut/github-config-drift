@@ -534,19 +534,51 @@ def workflow_findings(name, text):
     return found, stepped
 
 
+def pins_markdownlint(repo):
+    """Whether the repository pins markdownlint-cli2 itself.
+
+    A repository that names the tool in package.json runs it from its own
+    lockfile, so a local run and CI gate on the version a commit here declares.
+    The action bundles its own copy, and its tag is bumped through the
+    github-actions ecosystem while the lockfile is bumped through npm: carrying
+    both is two pins of one tool, free to drift apart, and the local run is then
+    checking against a version CI does not use.
+    """
+    content = fetch(repo, "package.json")
+    if content is None:
+        return False
+    tree = json.loads(decode(content))
+    return any("markdownlint-cli2" in (tree.get(key) or {}) for key in ("dependencies", "devDependencies"))
+
+
 def absent_step_findings(holds, repo, stepped):
     """Findings for a canonical step no workflow in the repository carries.
 
     Comparing a step only where one exists says nothing about a repository that
     holds shell and never added it, and that repository is the one worth hearing
     about. SHELL_EXEMPT names the ones that lint shell some other way.
+
+    The Markdown gate has the same escape, derived rather than listed: a
+    repository holding its own pin is running the tool from that.
     """
     found = []
     if "action-shellcheck" not in stepped and repo not in SHELL_EXEMPT and holds("Shell"):
         found.append(("ShellCheck step", "no ShellCheck step in any workflow, and the repository holds shell"))
-    if "markdownlint-cli2-action" not in stepped:
+    pinned = pins_markdownlint(repo)
+    if "markdownlint-cli2-action" not in stepped and not pinned:
         found.append(
             ("markdownlint step", "no markdownlint step in any workflow, and every repository here holds Markdown")
+        )
+    if "markdownlint-cli2-action" in stepped and pinned:
+        found.append(
+            (
+                "markdownlint step",
+                (
+                    "the action step and a package.json pin, which are two pins of one tool: "
+                    "the lockfile is bumped through npm and the action's tag through github-actions, "
+                    "so a local run and this gate can end up on different versions"
+                ),
+            )
         )
     return found
 

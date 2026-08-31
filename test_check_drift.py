@@ -782,22 +782,57 @@ class TestWorkflowFindings:
         assert stepped == {"action-shellcheck", "markdownlint-cli2-action"}
 
 
+def no_package_json(monkeypatch):
+    """The repository carries no package.json, so it pins markdownlint nowhere."""
+    monkeypatch.setattr(cd, "fetch", lambda repo, path: None)
+
+
+def pinning_package_json(monkeypatch, section="devDependencies"):
+    """The repository pins markdownlint-cli2 itself."""
+    body = json.dumps({section: {"markdownlint-cli2": "0.23.2"}})
+    monkeypatch.setattr(cd, "fetch", lambda repo, path: base64.b64encode(body.encode()).decode())
+
+
 class TestAbsentStepFindings:
     """A canonical step no workflow in the repository carries."""
 
-    def test_a_repository_holding_shell_with_no_step_is_reported(self):
+    def test_a_repository_holding_shell_with_no_step_is_reported(self, monkeypatch):
+        no_package_json(monkeypatch)
         assert cd.absent_step_findings(lambda _: True, "demo", {"markdownlint-cli2-action"}) == [
             ("ShellCheck step", "no ShellCheck step in any workflow, and the repository holds shell")
         ]
 
-    def test_a_repository_that_lints_shell_some_other_way_is_exempt(self):
+    def test_a_repository_that_lints_shell_some_other_way_is_exempt(self, monkeypatch):
+        no_package_json(monkeypatch)
         exempt = next(iter(cd.SHELL_EXEMPT))
         assert cd.absent_step_findings(lambda _: True, exempt, {"markdownlint-cli2-action"}) == []
 
-    def test_a_repository_github_reports_no_shell_for_needs_no_step(self):
+    def test_a_repository_github_reports_no_shell_for_needs_no_step(self, monkeypatch):
+        no_package_json(monkeypatch)
         assert cd.absent_step_findings(lambda _: False, "demo", {"markdownlint-cli2-action"}) == []
 
-    def test_the_markdownlint_step_is_expected_of_every_repository(self):
+    def test_the_markdownlint_step_is_expected_of_every_repository(self, monkeypatch):
+        no_package_json(monkeypatch)
+        assert cd.absent_step_findings(lambda _: False, "demo", {"action-shellcheck"}) == [
+            ("markdownlint step", "no markdownlint step in any workflow, and every repository here holds Markdown")
+        ]
+
+    @pytest.mark.parametrize("section", ["devDependencies", "dependencies"])
+    def test_a_repository_holding_its_own_pin_needs_no_action_step(self, monkeypatch, section):
+        """It runs the tool out of its lockfile, at the version a commit there declares."""
+        pinning_package_json(monkeypatch, section)
+        assert cd.absent_step_findings(lambda _: False, "demo", {"action-shellcheck"}) == []
+
+    def test_carrying_both_the_step_and_a_pin_is_reported(self, monkeypatch):
+        """Two pins of one tool, bumped by two ecosystems, free to drift apart."""
+        pinning_package_json(monkeypatch)
+        found = cd.absent_step_findings(lambda _: False, "demo", {"markdownlint-cli2-action"})
+        assert [label for label, _ in found] == ["markdownlint step"]
+        assert "two pins of one tool" in found[0][1]
+
+    def test_a_package_json_naming_some_other_tool_is_not_a_pin(self, monkeypatch):
+        body = json.dumps({"devDependencies": {"prettier": "^3.9.6"}})
+        monkeypatch.setattr(cd, "fetch", lambda repo, path: base64.b64encode(body.encode()).decode())
         assert cd.absent_step_findings(lambda _: False, "demo", {"action-shellcheck"}) == [
             ("markdownlint step", "no markdownlint step in any workflow, and every repository here holds Markdown")
         ]
@@ -868,6 +903,9 @@ class TestCheck:
             ".github/workflows/ai-attributions.yml",
             "workflows/",
             "languages/Shell",
+            # Asked for a third time, and answered from the cache in gh(): the
+            # markdownlint step is excused where a repository pins the tool.
+            "package.json",
         ]
 
     def test_a_repository_matching_canon_reports_nothing_and_tallies_its_actions(self, monkeypatch):

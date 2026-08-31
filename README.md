@@ -84,6 +84,12 @@ absent and reported where the language is present and the config is not.
 
 Markdown has no exemption list. Every repository here carries at least a
 `README.md`, so both `.markdownlint-cli2.yaml` and the step are expected everywhere.
+The step has one escape, derived rather than named: a repository that pins
+markdownlint-cli2 in its own `package.json` runs the tool from that lockfile, at
+the version a commit there declares, and needs no action step. Carrying both is
+reported, because the action bundles a second copy whose tag is bumped through the
+github-actions ecosystem while the lockfile is bumped through npm, so the two are
+free to drift and a local run then checks against a version the gate does not use.
 
 A query that failed is neither presence nor absence, and the two are easy to
 confuse: `gh` exits non-zero for a file a repository does not carry and for a call
