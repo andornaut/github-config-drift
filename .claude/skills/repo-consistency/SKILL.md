@@ -1,6 +1,8 @@
 ---
 name: repo-consistency
 description: Audit @andornaut's GitHub repositories for consistency and correctness across repo settings, rulesets, CI/CD workflows and releases. Invoke when asked to review repos for consistency, check CI/CD across repositories, find configuration drift, or verify that global patterns hold. Reports deviations so each can be confirmed as deliberate or repaired.
+context: fork
+agent: general-purpose
 ---
 
 # Repository consistency audit
@@ -338,6 +340,11 @@ default, restoring canonical wording.
 adding required status checks, enabling scan flags, renaming a repo. Present the
 peer groups that already exist so the choice is "match this group" rather than an
 open design question.
+
+This skill runs in a subagent, which cannot prompt the operator. Apply the
+fix-without-asking pile, then end the report with the ask pile: one entry per
+decision, with the peer groups and a recommended option first, so the caller can
+put each one to the operator as a prompt.
 
 Land a deviant file as close to the canonical version as its comparison allows.
 `eslint.config.base.mjs`, `.husky/pre-commit` and the attributions workflow are compared
