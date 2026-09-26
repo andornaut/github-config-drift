@@ -21,13 +21,8 @@ The listing is the public endpoint rather than the authenticated one: a workflow
 `GITHUB_TOKEN` is not a user, so `user/repos` returns nothing for it. A repository
 created tomorrow is swept the following Monday with no edit here.
 
-`--exclude` drops a repository from that listing, and the `Drift` workflow passes
-`--exclude andornaut`. That repository is the profile README GitHub renders on the
-user page rather than a software project: it runs no CI, so the gates canon
-describes have nothing to gate, and the badges every README here carries do not
-belong on a profile page. The reason is written beside the flag in
-[the workflow](./.github/workflows/drift.yml). A repository named with `--repo` is
-read whatever the exclusions say.
+`--exclude` drops a repository from that listing. A repository named with `--repo`
+is read whatever the exclusions say.
 
 ## Reconciling
 
