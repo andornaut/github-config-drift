@@ -23,12 +23,14 @@ permissions:
 
 # One run at a time per event and branch. Spelled the same as every other
 # workflow's group. Keyed by the event, so a scheduled sweep and a push to main
-# do not cancel each other: a push landing while the week's scheduled run is
-# going would otherwise drop it, and the same drift reported twice costs less
-# than a sweep that never happened.
+# do not wait on or displace each other: the same drift reported twice costs
+# less than a sweep that never happened.
+# On main a run is never cancelled, since commits landing there seconds apart
+# would otherwise leave the earlier one with no result. A newer run waits for
+# the running one instead, and GitHub keeps only the latest waiting run.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   drift:

@@ -100,7 +100,10 @@ hook and CI have to cover one set of files: a hand-written list of types is how 
 hook came to check less than `prettier --check .` does, missing the
 `.markdownlint-cli2.yaml` every repository carries. The same repository is expected
 to carry `.husky/pre-commit`, compared byte for byte: it is one line,
-`npx lint-staged`, and every difference is a difference in what the hook runs.
+`npx lint-staged --concurrent false`, and every difference is a difference in
+what the hook runs. It runs the entries serially because the prettier and eslint
+entries match the same scripts, and two tasks rewriting one file at once lose one
+of the fixes.
 
 `.github/workflows/ai-attributions.yml` is compared byte for byte in every
 repository, rather than by step as the ShellCheck and markdownlint gates are. It is
