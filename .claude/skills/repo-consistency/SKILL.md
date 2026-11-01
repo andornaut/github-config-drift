@@ -7,9 +7,10 @@ agent: general-purpose
 
 # Repository consistency audit
 
-Establishes what the global pattern is by majority across repositories, then reports
-every deviation from it. A deviation is not automatically a defect: the point is to
-surface each one so the operator confirms it as deliberate or repairs it.
+Establishes the shared configuration and reports deviations across repositories.
+For version mismatches, update canon and all copies to the newer supported release
+after checking compatibility, even when the majority still uses the older release.
+Review non-version deviations before deciding whether to repair them.
 
 Run `python3 check-drift.py` in this repository first. It compares the shared
 configuration files (`.golangci.yml`, `ruff.toml`, `.markdownlint-cli2.yaml`,
@@ -332,11 +333,12 @@ about what a check rejects is a correctness defect.
 
 ## Fix vs ask
 
-**Fix without asking** when the change matches an existing majority and has no
-behavioral effect: correcting a factually wrong comment, tightening an unused token
-default, restoring canonical wording.
+**Fix without asking** for supported version reconciliation toward the newer
+release, including the corresponding canonical copy. Also fix changes that match
+an existing majority and have no behavioral effect: correcting a factually wrong
+comment, tightening an unused token default, restoring canonical wording.
 
-**Ask** when the change alters enforcement or requires a commit to a repo:
+**Ask** when the change alters enforcement beyond version reconciliation:
 adding required status checks, enabling scan flags, renaming a repo. Present the
 peer groups that already exist so the choice is "match this group" rather than an
 open design question.

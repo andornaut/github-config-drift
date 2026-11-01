@@ -26,9 +26,9 @@ is read whatever the exclusions say.
 
 ## Reconciling
 
-A report is not a verdict. Drift runs both ways: a repository can fall behind, and
-it can also be ahead, having reached a stricter position on its own. Read the diff
-before deciding which side moves.
+For a version mismatch, update canon and the repositories to the newer supported
+release after checking compatibility. Do not downgrade a newer copy to match the
+majority. Review non-version differences before deciding which side moves.
 
 Where the copies are meant to differ, they differ in named places:
 
