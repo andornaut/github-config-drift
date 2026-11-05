@@ -99,6 +99,7 @@ class TestDroppedIgnores:
             "**/node_modules/**",
             ".agents/**",
             ".claude/**",
+            ".codex/**",
             "AGENTS.md",
             "CLAUDE.md",
             "GEMINI.md",
