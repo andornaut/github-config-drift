@@ -3,6 +3,7 @@
 
 import base64
 import binascii
+import hashlib
 
 # Import the module by path: its name is not a Python identifier
 import importlib.util
@@ -1911,3 +1912,205 @@ class TestPlainContainerShellInputs:
         )
         with pytest.raises(ValueError, match="missing ShellCheck input scripts/test-in-container"):
             cd.container_steps({"lint"}, files)
+
+
+FARAMIR_MAKE = """.DEFAULT_GOAL := check
+CHECK_TASKS := lint test build
+export CHECK_TASKS COMMAND
+.PHONY: check check-info lint test build
+check:
+\t@tests/container/run check
+check-info:
+\t@tests/container/run info
+lint:
+\t@tests/container/run lint
+test:
+\t@tests/container/run test
+build:
+\t@tests/container/run build
+"""
+
+
+class TestFrozenHarness:
+    @staticmethod
+    def inputs(makefile=FARAMIR_MAKE, version="v24.21.0\n"):
+        reference = json.loads((cd.CANON / "container" / "harnesses.json").read_text())["faramir"]
+        files = reference["files"]
+        tree = {
+            "truncated": False,
+            "tree": [
+                {"path": path, "type": "blob", "mode": entry["mode"], "sha": entry["blob"]}
+                for path, entry in files.items()
+            ],
+        }
+        blobs = {entry["blob"]: entry["content"].encode() for entry in files.values()}
+        for path, text in (("Makefile", makefile), (".nvmrc", version)):
+            raw = text.encode()
+            sha = hashlib.sha1(b"blob " + str(len(raw)).encode() + b"\0" + raw, usedforsecurity=False).hexdigest()
+            tree["tree"].append({"path": path, "type": "blob", "mode": "100644", "sha": sha})
+            blobs[sha] = raw
+        return tree, blobs
+
+    @staticmethod
+    def install(monkeypatch, tree, blobs):
+        calls = []
+
+        def run(args, **kwargs):
+            calls.append(args[2])
+            if args[2].endswith("/git/trees/HEAD?recursive=1"):
+                return StubResult(stdout=json.dumps(tree))
+            sha = args[2].rsplit("/", 1)[1]
+            return StubResult(
+                stdout=json.dumps({"sha": sha, "encoding": "base64", "content": base64.b64encode(blobs[sha]).decode()})
+            )
+
+        monkeypatch.setattr(cd.subprocess, "run", run)
+        return calls
+
+    @pytest.mark.parametrize("target", ["lint", "check"])
+    def test_reviewed_custom_dispatch_proves_both_tools_without_a_context_manifest(self, monkeypatch, target):
+        tree, blobs = self.inputs()
+        calls = self.install(monkeypatch, tree, blobs)
+
+        def unexpected(*args):
+            raise AssertionError("the custom profile must use verified immutable blobs, not contents paths")
+
+        monkeypatch.setattr(cd, "fetch", unexpected)
+        assert cd.make_findings({target}, "faramir") == ([], {"action-shellcheck", "markdownlint-cli2-action"})
+        assert len(calls) == 8
+        assert calls[0] == "repos/andornaut/faramir/git/trees/HEAD?recursive=1"
+        assert all("/git/blobs/" in endpoint for endpoint in calls[1:])
+        assert all("context" not in endpoint for endpoint in calls)
+
+    @pytest.mark.parametrize("index", range(5))
+    @pytest.mark.parametrize("change", ["blob", "symlink", "mode", "missing"])
+    def test_all_five_frozen_files_must_match_before_any_content_read(self, monkeypatch, index, change):
+        tree, blobs = self.inputs()
+        entry = tree["tree"][index]
+        if change == "blob":
+            entry["sha"] = "0" * 40
+        elif change == "symlink":
+            entry["mode"] = "120000"
+        elif change == "mode":
+            entry["mode"] = "100644" if entry["mode"] == "100755" else "100755"
+        else:
+            tree["tree"].pop(index)
+        calls = self.install(monkeypatch, tree, blobs)
+        found, carried = cd.make_findings({"lint"}, "faramir")
+        assert len(found) == 1
+        assert carried == set()
+        assert len(calls) == 1
+
+    @pytest.mark.parametrize("index", range(5))
+    def test_frozen_source_bytes_are_checked_even_at_the_approved_blob_endpoint(self, monkeypatch, index):
+        tree, blobs = self.inputs()
+        blobs[tree["tree"][index]["sha"]] = b"exit 0\n"
+        self.install(monkeypatch, tree, blobs)
+        found, carried = cd.make_findings({"lint"}, "faramir")
+        assert len(found) == 1
+        assert "bytes differ" in found[0][1]
+        assert carried == set()
+
+    @pytest.mark.parametrize("path", ["Makefile", ".nvmrc"])
+    @pytest.mark.parametrize("change", ["symlink", "missing", "invalid-sha"])
+    def test_mutable_make_and_version_inputs_still_require_regular_git_files(self, monkeypatch, path, change):
+        tree, blobs = self.inputs()
+        entry = next(entry for entry in tree["tree"] if entry["path"] == path)
+        if change == "symlink":
+            entry["mode"] = "120000"
+        elif change == "missing":
+            tree["tree"].remove(entry)
+        else:
+            entry["sha"] = "not-a-git-id"
+        calls = self.install(monkeypatch, tree, blobs)
+        found, carried = cd.make_findings({"lint"}, "faramir")
+        assert len(found) == 1
+        assert carried == set()
+        assert len(calls) == 1
+
+    @pytest.mark.parametrize("path", ["Makefile", ".nvmrc"])
+    def test_regular_input_bytes_must_match_the_immutable_git_blob_id(self, monkeypatch, path):
+        tree, blobs = self.inputs()
+        entry = next(entry for entry in tree["tree"] if entry["path"] == path)
+        blobs[entry["sha"]] += b"replacement"
+        self.install(monkeypatch, tree, blobs)
+        with pytest.raises(cd.GhError, match="immutable Git ID"):
+            cd.make_findings({"lint"}, "faramir")
+
+    @pytest.mark.parametrize("version", ["$(command)\n", "v24.21.0; true\n", "24.21.0\n"])
+    def test_node_version_is_literal_numeric_data(self, monkeypatch, version):
+        tree, blobs = self.inputs(version=version)
+        self.install(monkeypatch, tree, blobs)
+        found, carried = cd.make_findings({"lint"}, "faramir")
+        assert len(found) == 1
+        assert "numeric Node version" in found[0][1]
+        assert carried == set()
+
+    @pytest.mark.parametrize(
+        ("before", "after"),
+        [
+            ("@tests/container/run lint", "@tests/container/run lint || true"),
+            ("CHECK_TASKS := lint test build", "CHECK_TASKS := $(shell echo lint)"),
+            ("CHECK_TASKS := lint test build", "CHECK_TASKS := test"),
+            (".DEFAULT_GOAL := check", "SHELL := true"),
+            (".DEFAULT_GOAL := check", ".IGNORE:"),
+            ("@tests/container/run info", "@printf forged"),
+        ],
+    )
+    def test_make_dispatch_and_declared_categories_cannot_be_masked_or_overridden(self, monkeypatch, before, after):
+        text = FARAMIR_MAKE.replace(before, after)
+        tree, blobs = self.inputs(makefile=text)
+        self.install(monkeypatch, tree, blobs)
+        found, carried = cd.make_findings({"lint"}, "faramir")
+        assert len(found) == 1
+        assert carried == set()
+
+    def test_custom_check_prerequisites_cannot_precede_the_frozen_dispatch(self, monkeypatch):
+        text = FARAMIR_MAKE.replace("check:\n", "check: bypass\n") + "bypass:\n\t@true\n"
+        tree, blobs = self.inputs(makefile=text)
+        self.install(monkeypatch, tree, blobs)
+        found, carried = cd.make_findings({"check"}, "faramir")
+        assert len(found) == 1
+        assert "does not dispatch directly" in found[0][1]
+        assert carried == set()
+
+    def test_a_check_without_declared_lint_carries_no_lint_coverage(self, monkeypatch):
+        tree, blobs = self.inputs(
+            makefile=FARAMIR_MAKE.replace("CHECK_TASKS := lint test build", "CHECK_TASKS := test")
+        )
+        self.install(monkeypatch, tree, blobs)
+        assert cd.make_findings({"check"}, "faramir") == ([], set())
+
+    def test_truncation_is_unknown_instead_of_missing_context_or_clean(self, monkeypatch):
+        tree, blobs = self.inputs()
+        tree["truncated"] = True
+        calls = self.install(monkeypatch, tree, blobs)
+        with pytest.raises(cd.GhError, match="nontruncated"):
+            cd.make_findings({"lint"}, "faramir")
+        assert len(calls) == 1
+
+    def test_other_repositories_cannot_claim_the_custom_harness(self):
+        with pytest.raises(ValueError, match="repository-scoped"):
+            cd.harness_steps({"lint"}, "demo")
+
+    @pytest.mark.parametrize("tool", ["shellcheck", "markdownlint-cli2"])
+    def test_frozen_harness_tools_must_follow_canonical_pin_upgrades(self, monkeypatch, tmp_path, tool):
+        tree, blobs = self.inputs()
+        self.install(monkeypatch, tree, blobs)
+        canon = tmp_path / "configs"
+        for path in cd.CANON.rglob("*"):
+            if path.is_file():
+                target = canon / path.relative_to(cd.CANON)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(path.read_bytes())
+        if tool == "shellcheck":
+            path = canon / "shell" / "shellcheck-step.yml"
+            path.write_text(path.read_text().replace("v0.11.0", "v0.12.0"))
+        else:
+            path = canon / "container" / "tools.json"
+            path.write_text(path.read_text().replace("0.24.0", "0.25.0"))
+        monkeypatch.setattr(cd, "CANON", canon)
+        found, carried = cd.make_findings({"lint"}, "faramir")
+        assert len(found) == 1
+        assert "tool pins differ" in found[0][1]
+        assert carried == set()

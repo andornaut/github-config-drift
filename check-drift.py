@@ -972,6 +972,82 @@ def container_steps(targets, files):
     return carried
 
 
+def source_api(label, endpoint):
+    """Keep malformed Git API responses distinct from configuration drift."""
+    try:
+        response = json.loads(gh("api", endpoint))
+    except (json.JSONDecodeError, TypeError) as error:
+        raise GhError(f"{label} API did not return a JSON object") from error
+    if not isinstance(response, dict):
+        raise GhError(f"{label} API did not return a JSON object")
+    return response
+
+
+def reference_files(label, regular, reference, repo):
+    """Check every file's Git metadata before reading any immutable blob bytes."""
+    approved = reference.get("files")
+    if not isinstance(approved, dict) or not approved or set(approved).intersection(regular):
+        raise ValueError(f"{label} reference must name its fixed helper files")
+    for expected in approved.values():
+        if (
+            not isinstance(expected, dict)
+            or any(key not in expected for key in ("mode", "blob", "sha256", "content"))
+            or not isinstance(expected["content"], str)
+        ):
+            raise ValueError(f"{label} reference is incomplete")
+        if hashlib.sha256(expected["content"].encode()).hexdigest() != expected["sha256"]:
+            raise ValueError(f"{label} reference bytes do not match their digest")
+    tree = source_api(label, f"repos/andornaut/{repo}/git/trees/HEAD?recursive=1")
+    if tree.get("truncated") is not False or not isinstance(tree.get("tree"), list):
+        raise GhError(f"{label} requires a complete nontruncated Git tree")
+    entries = {}
+    for entry in tree["tree"]:
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+            raise GhError(f"{label} Git tree contains malformed entries")
+        path = entry["path"]
+        if path not in set(approved) | set(regular):
+            continue
+        if path in entries:
+            raise GhError(f"{label} Git tree contains duplicate helper paths")
+        entries[path] = entry
+    for path, expected in approved.items():
+        entry = entries.get(path)
+        if entry is None:
+            raise ValueError(f"missing approved {label} helper {path}")
+        if entry.get("type") != "blob" or entry.get("mode") != expected["mode"] or entry.get("sha") != expected["blob"]:
+            raise ValueError(f"{label} helper metadata differs for {path}")
+    for path, mode in regular.items():
+        entry = entries.get(path)
+        if (
+            entry is None
+            or entry.get("type") != "blob"
+            or entry.get("mode") != mode
+            or not isinstance(entry.get("sha"), str)
+            or COMMIT_REF.fullmatch(entry["sha"]) is None
+        ):
+            raise ValueError(f"{label} needs a regular Git file at {path}")
+    content = {}
+    for path in [*approved, *regular]:
+        expected = approved.get(path)
+        sha = expected["blob"] if expected else entries[path]["sha"]
+        blob = source_api(label, f"repos/andornaut/{repo}/git/blobs/{sha}")
+        if blob.get("sha") != sha or blob.get("encoding") != "base64" or not isinstance(blob.get("content"), str):
+            raise GhError(f"{label} blob response has invalid metadata")
+        try:
+            raw = base64.b64decode("".join(blob["content"].split()), validate=True)
+        except binascii.Error as error:
+            raise GhError(f"{label} blob response has invalid base64") from error
+        if expected and hashlib.sha256(raw).hexdigest() != expected["sha256"]:
+            raise ValueError(f"{label} helper bytes differ for {path}")
+        if (
+            expected is None
+            and hashlib.sha1(b"blob " + str(len(raw)).encode() + b"\0" + raw, usedforsecurity=False).hexdigest() != sha
+        ):
+            raise GhError(f"{label} blob bytes do not match their immutable Git ID")
+        content[path] = raw
+    return content
+
+
 def admission_makefile(repo, text):
     """Prove the repository-scoped resource hook before following immutable blobs."""
     declarations = list(
@@ -992,61 +1068,63 @@ def admission_makefile(repo, text):
     approved = reference.get("files")
     if not isinstance(approved, dict) or set(approved) != {"tests/container/admit", "tests/container/admit.mjs"}:
         raise ValueError("resource admission reference must name both fixed helper files")
-    for expected in approved.values():
-        if not isinstance(expected, dict) or any(key not in expected for key in ("mode", "blob", "sha256", "content")):
-            raise ValueError("resource admission reference is incomplete")
-        if hashlib.sha256(expected["content"].encode()).hexdigest() != expected["sha256"]:
-            raise ValueError("resource admission reference bytes do not match their digest")
-
-    def api(endpoint):
-        try:
-            response = json.loads(gh("api", endpoint))
-        except (json.JSONDecodeError, TypeError) as error:
-            raise GhError("resource admission API did not return a JSON object") from error
-        if not isinstance(response, dict):
-            raise GhError("resource admission API did not return a JSON object")
-        return response
-
-    tree = api(f"repos/andornaut/{repo}/git/trees/HEAD?recursive=1")
-    if tree.get("truncated") is not False or not isinstance(tree.get("tree"), list):
-        raise GhError("resource admission requires a complete nontruncated Git tree")
-    entries = {}
-    for entry in tree["tree"]:
-        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
-            raise GhError("resource admission Git tree contains malformed entries")
-        path = entry["path"]
-        if path not in approved:
-            continue
-        if path in entries:
-            raise GhError("resource admission Git tree contains duplicate helper paths")
-        entries[path] = entry
-    for path, expected in approved.items():
-        entry = entries.get(path)
-        if entry is None:
-            raise ValueError(f"missing approved resource admission helper {path}")
-        if entry.get("type") != "blob" or entry.get("mode") != expected["mode"] or entry.get("sha") != expected["blob"]:
-            raise ValueError(f"resource admission helper metadata differs for {path}")
-    for path, expected in approved.items():
-        blob = api(f"repos/andornaut/{repo}/git/blobs/{expected['blob']}")
-        if (
-            blob.get("sha") != expected["blob"]
-            or blob.get("encoding") != "base64"
-            or not isinstance(blob.get("content"), str)
-        ):
-            raise GhError("resource admission blob response has invalid metadata")
-        try:
-            content = base64.b64decode("".join(blob["content"].split()), validate=True)
-        except binascii.Error as error:
-            raise GhError("resource admission blob response has invalid base64") from error
-        if hashlib.sha256(content).hexdigest() != expected["sha256"]:
-            raise ValueError(f"resource admission helper bytes differ for {path}")
+    reference_files("resource admission", {}, reference, repo)
     # The exact approved hook only admits resources; it cannot replace a lint command.
     match = selected[0]
     return text[: match.start()] + "CHECK_ADMISSION :=" + text[match.end() :]
 
 
+def harness_steps(targets, repo):
+    """Prove only lint coverage through one reviewed project-owned harness."""
+    reference_path = CANON / "container" / "harnesses.json"
+    if not reference_path.is_file():
+        raise ValueError("custom lint harness reference is missing")
+    references = json.loads(reference_path.read_text())
+    reference = references.get(repo) if isinstance(references, dict) else None
+    expected_paths = {
+        "tests/container/run",
+        "tests/container/check",
+        "tests/container/Dockerfile",
+        "tests/source.sh",
+        "tests/go/cache.sh",
+    }
+    if repo != "faramir" or not isinstance(reference, dict) or set(reference.get("files", {})) != expected_paths:
+        raise ValueError("custom lint harness needs its approved repository-scoped reference")
+    files = reference_files("custom lint harness", {"Makefile": "100644", ".nvmrc": "100644"}, reference, repo)
+    if re.fullmatch(rb"v[0-9]+\.[0-9]+\.[0-9]+\n?", files[".nvmrc"]) is None:
+        raise ValueError("custom lint harness needs a literal numeric Node version")
+    makefile = files["Makefile"].decode()
+    normalized = makefile.replace("\t@tests/container/run lint\n", "\t@./tests/container/run $@\n")
+    normalized = normalized.replace("\t@tests/container/run info\n", "\t@./tests/container/run info\n")
+    tasks, recipes = make_tasks(normalized)
+    if "lint" in targets and "lint" not in tasks:
+        raise ValueError("selected make lint is absent from CHECK_TASKS")
+    if "lint" not in tasks or not targets.intersection({"lint", "check"}):
+        return set()
+    if "lint" not in targets and recipes.get("check") != ["@tests/container/run check"]:
+        raise ValueError("custom make check does not dispatch directly to the reviewed lint harness")
+    docker = files["tests/container/Dockerfile"].decode()
+    shell_pin = yaml.safe_load((CANON / "shell" / "shellcheck-step.yml").read_text())[0]["with"]["version"]
+    markdown_pin = json.loads((CANON / "container" / "tools.json").read_text())["markdownlint-cli2"]
+    if (
+        f"COPY --from=koalaman/shellcheck:{shell_pin} /bin/shellcheck /usr/local/bin/shellcheck"
+        not in docker.splitlines()
+        or re.search(
+            r"npm install --global --ignore-scripts markdownlint-cli2@" + re.escape(markdown_pin) + r"(?=\s|$)", docker
+        )
+        is None
+    ):
+        raise ValueError("custom lint harness tool pins differ from canon")
+    return {"action-shellcheck", "markdownlint-cli2-action"}
+
+
 def make_findings(targets, repo):
     """Fetch a Make contract only after CI selects its literal check categories."""
+    if repo == "faramir":
+        try:
+            return [], harness_steps(targets, repo)
+        except (ValueError, TypeError, KeyError) as error:
+            return [("Make checks", str(error))], set()
     paths = (
         "Makefile",
         "tests/container/run",
