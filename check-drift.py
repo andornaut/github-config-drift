@@ -796,6 +796,19 @@ WORKFLOW_STEPS = (
 )
 
 
+def make_job_environment(environment):
+    """Allow only a literal local image tag, which the launcher replaces with its IID."""
+    if environment is None:
+        return True
+    if not isinstance(environment, dict) or set(environment) - {"CONTAINER_IMAGE"}:
+        return False
+    image = environment.get("CONTAINER_IMAGE")
+    return not environment or (
+        isinstance(image, str)
+        and re.fullmatch(r"[a-z0-9][a-z0-9_.-]*(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?", image) is not None
+    )
+
+
 def make_workflow_targets(text):
     """Literal Make categories that an unmasked workflow step actually runs."""
     document = yaml.safe_load(text)
@@ -815,7 +828,11 @@ def make_workflow_targets(text):
             match = re.fullmatch(r"make (check|lint)", command.strip())
             if (
                 match is None
-                or any(owner.get("continue-on-error") or owner.get("env") for owner in (document, job, step))
+                or any(owner.get("continue-on-error") for owner in (document, job, step))
+                or document.get("env")
+                or step.get("env")
+                or not make_job_environment(job.get("env"))
+                or re.search(r"\bINNER\b", text)
                 or any(owner.get("if") not in (None, "success()") for owner in (job, step))
                 or any(owner.get("defaults") for owner in (document, job))
                 or step.get("working-directory")
@@ -830,6 +847,16 @@ def make_workflow_targets(text):
 
 def make_tasks(text):
     """Read the restricted Make interface without evaluating any repository code."""
+    # The reviewed inner branch is used inside the image; CI selects the outer dispatcher.
+    inner = (
+        "ifeq ($(INNER),1)\n"
+        "check lint test build exec:\n\t@/opt/check/run $@\n"
+        "else\n"
+        "check lint test build exec:\n\t@./tests/container/run $@\n"
+        "endif\n"
+    )
+    if text.count(inner) == 1:
+        text = text.replace(inner, "check lint test build exec:\n\t@./tests/container/run $@\n")
     tasks = None
     exported = False
     recipes = {}
@@ -923,6 +950,7 @@ def make_tasks(text):
                 "BASH_ENV",
                 "ENV",
                 "LD_PRELOAD",
+                "INNER",
             }:
                 raise ValueError("Make control overrides are unsupported")
             literal = line.replace("$(patsubst v%,%,$(shell cat .nvmrc))", "")

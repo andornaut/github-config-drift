@@ -2450,3 +2450,89 @@ class TestFrozenHarness:
         assert len(found) == 1
         assert "tool pins differ" in found[0][1]
         assert carried == set()
+
+
+class TestDeliveryMakeInterface:
+    INNER = (
+        "ifeq ($(INNER),1)\n"
+        "check lint test build exec:\n\t@/opt/check/run $@\n"
+        "else\n"
+        "check lint test build exec:\n\t@./tests/container/run $@\n"
+        "endif\n"
+    )
+
+    @staticmethod
+    def workflow(environment=None):
+        job = {"runs-on": "ubuntu-latest", "steps": [{"run": "make check"}]}
+        if environment is not None:
+            job["env"] = environment
+        return {"jobs": {"check": job}}
+
+    @classmethod
+    def makefile(cls):
+        return MAKE_INTERFACE.replace("check lint test build exec:\n\t@./tests/container/run $@\n", cls.INNER).replace(
+            "PYTHON_VERSION=$(shell cat .python-version)", "NODE_VERSION=$(shell sed 's/^v//' .nvmrc)"
+        )
+
+    @pytest.mark.parametrize("environment", [None, {}, {"CONTAINER_IMAGE": "local-check:delivery-kit-ci"}])
+    def test_a_literal_job_image_name_preserves_the_selected_target(self, environment):
+        assert cd.make_workflow_targets(yaml.safe_dump(self.workflow(environment))) == ({"check"}, [])
+
+    @pytest.mark.parametrize("key", ["INNER", "MAKEFLAGS", "PATH", "CHECK_TASKS", "COMMAND", "CHECK_ADMISSION"])
+    def test_an_image_name_does_not_admit_other_job_controls(self, key):
+        document = self.workflow({"CONTAINER_IMAGE": "local-check:delivery-kit-ci", key: "1"})
+        targets, findings = cd.make_workflow_targets(yaml.safe_dump(document))
+        assert targets == set()
+        assert len(findings) == 1
+
+    @pytest.mark.parametrize(
+        "image", [None, True, 1, [], {}, "${{ vars.IMAGE }}", "$(command)", "name; true", "name with spaces", "-name"]
+    )
+    def test_image_names_are_literal_strings_without_shell_or_expression_syntax(self, image):
+        assert not cd.make_job_environment({"CONTAINER_IMAGE": image})
+
+    @pytest.mark.parametrize("owner", ["workflow", "step"])
+    def test_the_image_exception_is_limited_to_the_reviewed_job_interface(self, owner):
+        document = self.workflow()
+        subject = document if owner == "workflow" else document["jobs"]["check"]["steps"][0]
+        subject["env"] = {"CONTAINER_IMAGE": "local-check:delivery-kit-ci"}
+        targets, findings = cd.make_workflow_targets(yaml.safe_dump(document))
+        assert targets == set()
+        assert len(findings) == 1
+
+    @pytest.mark.parametrize("control", [{"env": {"INNER": "1"}}, {"run": "echo INNER=1 >> $GITHUB_ENV"}])
+    def test_inner_control_in_another_step_cannot_select_the_inside_dispatcher(self, control):
+        document = self.workflow()
+        document["jobs"]["check"]["steps"].insert(0, control)
+        targets, findings = cd.make_workflow_targets(yaml.safe_dump(document))
+        assert targets == set()
+        assert len(findings) == 1
+
+    def test_only_the_reviewed_outer_dispatch_is_used_for_the_make_proof(self):
+        text = self.makefile()
+        tasks, recipes = cd.make_tasks(text)
+        assert tasks == ["lint", "test", "build"]
+        assert recipes["check"] == recipes["lint"] == ["@./tests/container/run $@"]
+        assert self.INNER in text
+        assert "NODE_VERSION=$(shell sed 's/^v//' .nvmrc)" in text
+
+    @pytest.mark.parametrize(
+        ("before", "after"),
+        [
+            ("ifeq", "ifneq"),
+            ("$(INNER),1", "$(OTHER),1"),
+            ("$(INNER),1", "$(INNER),0"),
+            ("@/opt/check/run $@", "@/opt/check/run $@ || true"),
+            ("@./tests/container/run $@", "@./tests/container/run $@ || true"),
+            ("check lint test build exec:", "check lint test build exec: prerequisite"),
+            ("endif\n", ""),
+        ],
+    )
+    def test_other_conditions_or_masked_dispatch_do_not_match_the_reviewed_block(self, before, after):
+        with pytest.raises(ValueError, match="Make syntax"):
+            cd.make_tasks(self.makefile().replace(before, after))
+
+    @pytest.mark.parametrize("declaration", ["INNER := 1", "INNER = 1", "INNER ?= 1", "export INNER", "lint: INNER=1"])
+    def test_inner_cannot_be_overridden_outside_the_reviewed_block(self, declaration):
+        with pytest.raises(ValueError, match="Make"):
+            cd.make_tasks(self.makefile() + declaration + "\n")
