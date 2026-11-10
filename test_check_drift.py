@@ -2536,54 +2536,24 @@ class TestDeliveryMakeInterface:
             cd.make_tasks(self.makefile() + declaration + "\n")
 
 
-def staged_files():
-    """Guarded formatter hooks with a frozen root Node tool installation."""
+def root_node_files():
+    """A frozen root manifest install through the reviewed direct lint profile."""
     files = container_files()
-    files["tests/container/Dockerfile"] = "\n".join(DOCKER_PROFILES["game-dev"]) + "\n"
     profiles = json.loads((cd.CANON / "container" / "check-profiles.json").read_text())
-    files["tests/container/check"] = profiles["bridges"]["game-dev"]["helper"]
+    bridge = profiles["bridges"]["game-dev"]
+    files["tests/container/Dockerfile"] = "\n".join(DOCKER_PROFILES["game-dev"]) + "\n"
+    files["tests/container/check"] = bridge["helper"]
     files["tests/container/context"] += "package.json\npackage-lock.json\n"
-    reference = json.loads((cd.CANON / "container" / "staged.json").read_text())
-    files.update({path: entry["content"] for path, entry in reference["files"].items()})
-    dependencies = {"markdownlint-cli2": "0.24.0", "prettier": "^3.9.10", "lint-staged": "^17.6.0"}
-    files["package.json"] = json.dumps({"devDependencies": dependencies})
-    files["package-lock.json"] = json.dumps(
-        {
-            "packages": {"": {"devDependencies": dependencies}}
-            | {"node_modules/" + name: {"version": version.lstrip("^")} for name, version in dependencies.items()}
-        }
-    )
-    files[".lintstagedrc"] = '{"*":"./tests/container/staged prettier --write --ignore-unknown"}\n'
-    files[".husky/pre-commit"] = "./tests/container/staged orchestrate\n"
+    files["package.json"] = '{"devDependencies":{"markdownlint-cli2":"0.24.0"}}'
+    files["package-lock.json"] = '{"packages":{"node_modules/markdownlint-cli2":{"version":"0.24.0"}}}'
+    for path in bridge["shell_inputs"]:
+        files.setdefault(path, "#!/bin/sh\nset -eu\n")
     return files
 
 
-class TestStagedContainer:
-    @staticmethod
-    def inputs(files):
-        tree = {"truncated": False, "tree": []}
-        blobs = {}
-        for path, text in files.items():
-            raw = text.encode()
-            sha = hashlib.sha1(b"blob " + str(len(raw)).encode() + b"\0" + raw, usedforsecurity=False).hexdigest()
-            mode = (
-                "100755"
-                if path
-                in {
-                    "tests/container/run",
-                    "tests/container/check",
-                    "tests/container/staged",
-                    "tests/container/staged-git",
-                    ".husky/pre-commit",
-                }
-                else "100644"
-            )
-            tree["tree"].append({"path": path, "type": "blob", "mode": mode, "sha": sha})
-            blobs[sha] = raw
-        return tree, blobs
-
+class TestContainerManifests:
     def test_root_manifest_copy_proves_both_gates_without_fetching_nested_packages(self, monkeypatch):
-        files = staged_files()
+        files = root_node_files()
         patches, calls = repository(files)
         monkeypatch.setattr(cd, "fetch", patches["fetch"])
         assert cd.make_findings({"check"}, "demo") == ([], {"action-shellcheck", "markdownlint-cli2-action"})
@@ -2606,160 +2576,62 @@ class TestStagedContainer:
         with pytest.raises(ValueError, match="one inspected"):
             cd.container_manifests(copy)
 
-    def test_verified_guarded_hooks_are_accepted_through_immutable_blobs_only(self, monkeypatch):
-        files = staged_files()
-        tree, blobs = self.inputs(files)
-        calls = TestFrozenHarness.install(monkeypatch, tree, blobs)
-        files[".markdownlint-cli2.yaml"] = (cd.CANON / "markdown" / "markdownlint-cli2.yaml").read_text()
-        files[".github/workflows/ai-attributions.yml"] = (cd.CANON / "attributions" / "ai-attributions.yml").read_text()
-        files[".github/workflows/test.yml"] = TestWorkflowFindings.with_steps("      - run: make check")
-        found, _ = TestCheck.run(monkeypatch, files, workflows=("test.yml",))
-        assert found == []
-        assert len(calls) == 12
-        assert all("/git/blobs/" in endpoint for endpoint in calls[1:])
 
-    @pytest.mark.parametrize("path", ["tests/container/staged", "tests/container/staged-git"])
-    @pytest.mark.parametrize("change", ["missing", "symlink", "mode", "blob"])
-    def test_both_approved_wrappers_require_fixed_regular_metadata_before_any_content(self, monkeypatch, path, change):
-        tree, blobs = self.inputs(staged_files())
-        entry = next(entry for entry in tree["tree"] if entry["path"] == path)
-        if change == "missing":
-            tree["tree"].remove(entry)
-        else:
-            field, value = {"symlink": ("mode", "120000"), "mode": ("mode", "100644"), "blob": ("sha", "0" * 40)}[
-                change
-            ]
-            entry[field] = value
-        calls = TestFrozenHarness.install(monkeypatch, tree, blobs)
-        with pytest.raises(ValueError, match=r"missing approved|metadata differs"):
-            cd.staged_hooks("demo")
-        assert len(calls) == 1
-
-    @pytest.mark.parametrize("path", ["tests/container/staged", "tests/container/staged-git"])
-    def test_each_approved_wrapper_still_requires_its_exact_source_digest(self, monkeypatch, path):
-        tree, blobs = self.inputs(staged_files())
-        entry = next(entry for entry in tree["tree"] if entry["path"] == path)
-        blobs[entry["sha"]] += b"\nexit 0\n"
-        TestFrozenHarness.install(monkeypatch, tree, blobs)
-        with pytest.raises(ValueError, match="bytes differ"):
-            cd.staged_hooks("demo")
-
-    @pytest.mark.parametrize(
-        "path",
-        [
-            "Makefile",
-            "tests/container/run",
-            "tests/container/check",
-            "tests/container/Dockerfile",
-            "tests/container/context",
-            "package.json",
-            "package-lock.json",
-            ".lintstagedrc",
-            ".husky/pre-commit",
-        ],
-    )
-    def test_every_transitive_input_must_be_a_regular_git_file_before_content_reads(self, monkeypatch, path):
-        tree, blobs = self.inputs(staged_files())
-        next(entry for entry in tree["tree"] if entry["path"] == path)["mode"] = "120000"
-        calls = TestFrozenHarness.install(monkeypatch, tree, blobs)
-        with pytest.raises(ValueError, match="regular Git file"):
-            cd.staged_hooks("demo")
-        assert len(calls) == 1
-
-    @pytest.mark.parametrize(
-        ("path", "before", "after"),
-        [
-            ("Makefile", "@./tests/container/run $@", "@true"),
-            ("tests/container/run", "set -euo pipefail", "set -uo pipefail"),
-            ("tests/container/check", 'markdownlint-cli2 "$@"', 'markdownlint-cli2 "$@" || true'),
-            ("tests/container/check", "shellcheck -x -P SCRIPTDIR", "echo shellcheck -x -P SCRIPTDIR"),
-            ("tests/container/Dockerfile", "shellcheck:v0.11.0", "shellcheck:v0.10.0"),
-            ("tests/container/Dockerfile", "node:24.22.2", "node:24.21.0"),
-            ("tests/container/Dockerfile", "--ignore-scripts ", ""),
-            ("tests/container/Dockerfile", "ENV PATH=/opt/check/node_modules/.bin:${PATH}", "ENV PATH=/fake:${PATH}"),
-            ("tests/container/context", "package-lock.json\n", ""),
-            (".lintstagedrc", "--ignore-unknown", "--ignore-unknown --quiet"),
-            (".husky/pre-commit", "orchestrate\n", "orchestrate --concurrent true\n"),
-        ],
-    )
-    def test_approved_wrappers_do_not_waive_their_commands_tools_or_make_wiring(self, monkeypatch, path, before, after):
-        files = staged_files()
-        assert before in files[path]
-        files[path] = files[path].replace(before, after)
-        tree, blobs = self.inputs(files)
-        TestFrozenHarness.install(monkeypatch, tree, blobs)
-        with pytest.raises(ValueError, match=r"Make|dispatcher|container|bridge|staged|Dockerfile"):
-            cd.staged_hooks("demo")
-
-    @pytest.mark.parametrize("tool", ["prettier", "lint-staged", "markdownlint-cli2"])
-    @pytest.mark.parametrize("location", ["manifest", "locked-root", "locked-tool"])
-    def test_formatter_and_orchestrator_pins_require_agreeing_frozen_tools(self, monkeypatch, tool, location):
-        files = staged_files()
-        path = "package.json" if location == "manifest" else "package-lock.json"
-        document = json.loads(files[path])
-        if location == "manifest":
-            document["devDependencies"][tool] = "*"
-        elif location == "locked-root":
-            document["packages"][""]["devDependencies"].pop(tool)
-        else:
-            document["packages"]["node_modules/" + tool]["version"] = "0.0.0"
-        files[path] = json.dumps(document)
-        tree, blobs = self.inputs(files)
-        TestFrozenHarness.install(monkeypatch, tree, blobs)
-        with pytest.raises(ValueError, match=r"tool|formatter"):
-            cd.staged_hooks("demo")
-
-    def test_plain_canonical_hooks_do_not_trigger_an_extra_git_tree_query(self, monkeypatch):
-        files = {
-            ".lintstagedrc": (cd.CANON / "javascript" / "lintstagedrc").read_text(),
-            ".husky/pre-commit": (cd.CANON / "javascript" / "husky-pre-commit").read_text(),
-        }
+class TestNativeFormattingHooks:
+    @staticmethod
+    def run(monkeypatch, formatter="prettier --write --ignore-unknown", hook="npx lint-staged --concurrent false\n"):
+        files = {".lintstagedrc": json.dumps({"*": formatter}), ".husky/pre-commit": hook}
 
         def forbidden(*args, **kwargs):
-            raise AssertionError("canonical hooks must not need staged source proof")
+            raise AssertionError("formatting hook comparison must not query Git trees or blobs")
 
         monkeypatch.setattr(cd.subprocess, "run", forbidden)
-        found, _ = TestCheck.run(monkeypatch, files)
+        return TestCheck.run(monkeypatch, files)
+
+    def test_native_automatic_formatting_keeps_its_canonical_commands_without_extra_api_reads(self, monkeypatch):
+        found, calls = self.run(monkeypatch)
         assert not any(label in {".lintstagedrc", ".husky/pre-commit"} for label, _ in found)
-
-    def test_failed_source_proof_keeps_both_hook_findings_visible(self, monkeypatch):
-        files = staged_files()
-        tree, blobs = self.inputs(files)
-        entry = next(entry for entry in tree["tree"] if entry["path"] == "tests/container/staged-git")
-        entry["mode"] = "120000"
-        TestFrozenHarness.install(monkeypatch, tree, blobs)
-        found, _ = TestCheck.run(monkeypatch, files)
-        assert [label for label, _ in found if "staged formatter proof" in _] == [
-            ".lintstagedrc",
-            ".husky/pre-commit",
-        ]
+        assert ".lintstagedrc" in calls
+        assert ".husky/pre-commit" in calls
+        assert "Makefile" not in calls
+        assert not any(path.startswith("tests/container/") for path in calls)
 
     @pytest.mark.parametrize(
-        ("path", "before", "after"),
+        ("formatter", "hook", "labels"),
         [
-            (".lintstagedrc", '"*"', '"*.md"'),
-            (".lintstagedrc", "--ignore-unknown", "--ignore-unknown --quiet"),
-            (".husky/pre-commit", "orchestrate\n", "orchestrate || true\n"),
-            (".husky/pre-commit", "./tests/container/staged orchestrate", "npx lint-staged --concurrent false"),
+            (
+                "./tests/container/staged prettier --write --ignore-unknown",
+                "./tests/container/staged orchestrate\n",
+                [".lintstagedrc", ".husky/pre-commit"],
+            ),
+            (
+                "tests/container/staged prettier --write --ignore-unknown",
+                "make staged\n",
+                [".lintstagedrc", ".husky/pre-commit"],
+            ),
+            ("prettier --write --ignore-unknown", "make staged\n", [".husky/pre-commit"]),
+            (
+                "prettier --write --ignore-unknown",
+                "./tests/container/staged orchestrate\n",
+                [".husky/pre-commit"],
+            ),
+            (
+                "tests/container/staged prettier --write --ignore-unknown",
+                "npx lint-staged --concurrent false\n",
+                [".lintstagedrc"],
+            ),
+            ("prettier --write", "npx lint-staged --concurrent false\n", [".lintstagedrc"]),
         ],
     )
-    def test_different_hook_commands_cannot_borrow_the_reviewed_wrapper_proof(self, monkeypatch, path, before, after):
-        files = staged_files()
-        files[path] = files[path].replace(before, after)
-
-        def forbidden(*args, **kwargs):
-            raise AssertionError("unreviewed hook commands must not enter the approved wrapper path")
-
-        monkeypatch.setattr(cd.subprocess, "run", forbidden)
-        found, _ = TestCheck.run(monkeypatch, files)
-        expected = ".lintstagedrc" if after == "npx lint-staged --concurrent false" else path
-        assert any(label == expected for label, _ in found)
-
-    def test_unknown_staged_source_never_becomes_a_success_or_configuration_difference(self, monkeypatch):
-        run = run_returning(StubResult(stdout='{"truncated":true,"tree":[]}'))
-        monkeypatch.setattr(cd.subprocess, "run", run)
-        with pytest.raises(cd.GhError, match="nontruncated"):
-            TestCheck.run(monkeypatch, staged_files())
+    def test_retired_wrappers_and_changed_formatter_arguments_remain_visible_drift(
+        self,
+        monkeypatch,
+        formatter,
+        hook,
+        labels,
+    ):
+        found, _ = self.run(monkeypatch, formatter, hook)
+        assert [label for label, _ in found if label in {".lintstagedrc", ".husky/pre-commit"}] == labels
 
 
 class TestFrozenMarkdownSecurity:
