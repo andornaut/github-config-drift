@@ -512,6 +512,7 @@ WORKFLOW_STEPS = (
     ("action-shellcheck", "ShellCheck step", ("shell", "shellcheck-step.yml"), SHELL_LOCAL),
     ("markdownlint-cli2-action", "markdownlint step", ("markdown", "markdownlint-step.yml"), ()),
     ("setup-docker-action", "Docker setup step", ("container", "docker-setup-step.yml"), ()),
+    ("setup-buildx-action", "Buildx setup step", ("container", "setup-buildx-step.yml"), ()),
 )
 
 
@@ -592,6 +593,8 @@ def make_tasks(text):
             allowed_exports = {
                 "CHECK_TASKS",
                 "BUILD_OUTPUTS",
+                "TEST_OUTPUTS",
+                "CHECK_ADMISSION",
                 "CONTAINER_BUILD_ARGS",
                 "TEST_ARGS",
                 "COMMAND",
@@ -642,13 +645,16 @@ def make_tasks(text):
                 "LD_PRELOAD",
             }:
                 raise ValueError("Make control overrides are unsupported")
-            literal = re.sub(r"\$\(shell cat \.(?:python-version|ruby-version|nvmrc)\)", "", line)
+            literal = line.replace("$(patsubst v%,%,$(shell cat .nvmrc))", "")
+            literal = re.sub(r"\$\(shell cat \.(?:python-version|ruby-version|nvmrc)\)", "", literal)
             literal = literal.replace("$(shell sed 's/^v//' .nvmrc)", "")
             literal = literal.replace("$(shell awk '$$1 == \"go\" {print $$2; exit}' go.mod)", "")
             literal = re.sub(r"\$\([A-Z_]+\)|\$\{[A-Z_]+\}|\$\$", "", literal)
             if "$" in literal:
                 raise ValueError("Make assignments contain unsupported expansion")
             value = match[2].strip()
+            if match[1] == "CHECK_ADMISSION" and value:
+                raise ValueError("nonempty CHECK_ADMISSION needs an inspected resource-only helper profile")
             variables[match[1]] = value if re.fullmatch(r"[A-Za-z0-9_./-]+", value) else None
         else:
             raise ValueError("Make syntax is outside the literal check interface")
@@ -689,7 +695,7 @@ def helper_profile(text):
                 ):
                     raise ValueError("Node task bodies must dispatch directly to internal npm scripts")
         elif re.sub(r"https://github.com/andornaut/[A-Za-z0-9_-]+\.git", "REPOSITORY", lint) != profile["lint"]:
-            raise ValueError(f"the {name} lint body differs from its inspected command profile")
+            continue
         return name, [line.strip() for line in lint.splitlines() if line.strip()]
     raise ValueError("container task helper differs from the inspected dispatch profiles")
 
@@ -772,6 +778,8 @@ def docker_instructions(text):
 def container_steps(targets, files):
     """Prove the bounded Make-to-container lint path from committed source only."""
     tasks, recipes = make_tasks(files["Makefile"])
+    if "lint" in targets and "lint" not in tasks:
+        raise ValueError("selected make lint is absent from CHECK_TASKS")
     if "lint" not in tasks or not targets.intersection({"lint", "check"}):
         return set()
     if "lint" not in targets and recipes.get("check") != ["@./tests/container/run $@"]:
@@ -782,6 +790,53 @@ def container_steps(targets, files):
     if docker_instructions(files["tests/container/Dockerfile"]) not in profiles["dockerfiles"].values():
         raise ValueError("Dockerfile differs from the inspected container instruction profiles")
     helper = files["tests/container/check"]
+    for name, bridge in profiles.get("bridges", {}).items():
+        if helper != bridge["helper"]:
+            continue
+        if docker_instructions(files["tests/container/Dockerfile"]) != profiles["dockerfiles"][name]:
+            raise ValueError("bridge helper and Dockerfile must use the same inspected profile")
+        pin = yaml.safe_load((CANON / "shell" / "shellcheck-step.yml").read_text())[0]["with"]["version"]
+        docker = docker_instructions(files["tests/container/Dockerfile"])
+        shell_install = (
+            f"COPY --from=koalaman/shellcheck:{pin} --chmod=0555 /bin/shellcheck /usr/local/bin/shellcheck"
+            if name == "game-kit"
+            else f"FROM koalaman/shellcheck:{pin} AS shellcheck"
+        )
+        if shell_install not in docker:
+            raise ValueError("bridge must install the canonical ShellCheck tool")
+        version = json.loads((CANON / "container" / "tools.json").read_text())["markdownlint-cli2"]
+        if name == "art-kit" and (
+            f"RUN npm install --prefix /opt/lint --ignore-scripts --no-audit --no-fund markdownlint-cli2@{version}"
+            not in docker
+        ):
+            raise ValueError("bridge must install the canonical Markdown tool")
+        context = set(files["tests/container/context"].splitlines())
+        required = {"tests/container/Dockerfile", "tests/container/check"}
+        if name == "game-kit":
+            required |= {"package.json", "package-lock.json"}
+            manifest = json.loads(files["package.json"])
+            lock = json.loads(files["package-lock.json"])
+            pin = json.loads((CANON / "container" / "tools.json").read_text())["markdownlint-cli2"]
+            if not isinstance(manifest, dict) or not isinstance(lock, dict):
+                raise TypeError("bridge Markdown manifests must be objects")
+            dependencies = manifest.get("devDependencies", {})
+            packages = lock.get("packages", {})
+            if (
+                not isinstance(dependencies, dict)
+                or not isinstance(packages, dict)
+                or not isinstance(packages.get("node_modules/markdownlint-cli2"), dict)
+                or dependencies.get("markdownlint-cli2") != pin
+                or packages["node_modules/markdownlint-cli2"].get("version") != pin
+            ):
+                raise ValueError("bridge must install the canonical locked Markdown tool")
+        else:
+            required.add("node/package.json")
+        if not required <= context:
+            raise ValueError("bridge context omits its inspected helper or manifests")
+        for path in bridge["shell_inputs"]:
+            if not files.get(path):
+                raise ValueError(f"missing ShellCheck input {path}")
+        return {"action-shellcheck", "markdownlint-cli2-action"}
     profile, profiled_commands = helper_profile(helper)
     if profile is not None and profile.startswith("node"):
         return node_container_steps(profiled_commands, files)
@@ -857,7 +912,7 @@ def container_steps(targets, files):
         stage = docker[stages[0] + 1 : next_stage]
         direct = f"RUN npm install --prefix /opt/markdown --no-audit --no-fund --ignore-scripts markdownlint-cli2@{pin}"
         installed = stage in ([direct], [global_install])
-        if profile == "rust":
+        if profile in {"rust", "rust-native"}:
             extra = profiles["helpers"]["rust"]["markdown_extra"]
             installed |= stage == [global_install, extra]
         if not installed and stage == [
@@ -927,10 +982,12 @@ def make_findings(targets, repo):
         if content is None:
             return [("Make checks", f"missing {path}")], set()
         files[path] = decode(content)
-    if "RUN npm ci --ignore-scripts --no-audit --no-fund" in files["tests/container/Dockerfile"]:
+    if "npm ci --ignore-scripts --no-audit --no-fund" in files["tests/container/Dockerfile"]:
         manifests = (
             ("package.json", "package-lock.json")
-            if "\nrun_task() {\n" in files["tests/container/check"]
+            if "COPY package.json package-lock.json ./" in files["tests/container/Dockerfile"]
+            or "COPY --chown=19001:19001 package.json package-lock.json /opt/check/"
+            in files["tests/container/Dockerfile"]
             else ("tests/container/package.json", "tests/container/package-lock.json")
         )
         for path in manifests:
@@ -944,6 +1001,11 @@ def make_findings(targets, repo):
         "scripts/test-in-container",
         ".cargo-husky/hooks/pre-commit",
         "tests/container/validate.py",
+        "tests/native/run",
+        "tests/native/check",
+        "scripts/check.sh",
+        "scripts/pack.sh",
+        "scripts/provision.sh",
     ):
         if path in files["tests/container/check"]:
             content = fetch(repo, path)
@@ -966,15 +1028,18 @@ def workflow_findings(name, text):
     found = [(f"workflow shape ({name})", complaint) for complaint in workflow_shape(text)]
     stepped = set()
     for action, label, canon_path, drop in WORKFLOW_STEPS:
-        if action == "setup-docker-action":
+        if action in {"setup-docker-action", "setup-buildx-action"}:
             document = yaml.safe_load(text)
             for job_id, job in (document.get("jobs") or {}).items():
                 for index, step in enumerate(job.get("steps") or [], 1):
-                    if "docker/setup-docker-action@" not in str(step.get("uses", "")):
+                    if f"docker/{action}@" not in str(step.get("uses", "")):
                         continue
                     stepped.add(action)
                     canon_step = yaml.safe_load(CANON.joinpath(*canon_path).read_text())[0]
-                    finding = step_finding(drop, f"{label} ({name}: {job_id}, step {index})", canon_step, step)
+                    compared = dict(step)
+                    if compared.get("if") == "runner.os == 'Linux'":
+                        compared.pop("if")
+                    finding = step_finding(drop, f"{label} ({name}: {job_id}, step {index})", canon_step, compared)
                     if finding:
                         found.append(finding)
             continue

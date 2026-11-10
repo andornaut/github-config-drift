@@ -14,6 +14,15 @@
     },
     "node-svelte": {
       "wrapper": "#!/bin/sh\nset -eu\n\ncd /work\nif [ ! -d node_modules ]; then\n    cp -R /opt/dependencies/node_modules node_modules\nfi\nexport PATH=\"/work/node_modules/.bin:${PATH}\"\nsvelte-kit sync\n\nrun_task() {\n    task=$1\n    shift\n    case \"$task\" in\n    lint)\n        : CHECK_LINT\n        ;;\n    test)\n        : CHECK_TEST\n        ;;\n    build)\n        : CHECK_BUILD\n        ;;\n    *)\n        printf 'Unknown check task: %s\\n' \"$task\" >&2\n        exit 2\n        ;;\n    esac\n}\n\ncase \"${1:-}\" in\ncheck)\n    for task in ${CHECK_TASKS:?CHECK_TASKS is required}; do\n        run_task \"$task\"\n    done\n    ;;\nlint|test|build)\n    task=$1\n    shift\n    run_task \"$task\" \"$@\"\n    ;;\nexec)\n    shift\n    if [ \"$#\" -gt 0 ]; then\n        exec \"$@\"\n    fi\n    : \"${COMMAND:?COMMAND is required}\"\n    exec sh -ec \"$COMMAND\"\n    ;;\n*)\n    printf 'Usage: check check|lint|test|build|exec\\n' >&2\n    exit 2\n    ;;\nesac\n"
+    },
+    "go-native": {
+      "wrapper": "#!/bin/sh\nset -eu\n\nmkdir -p /scratch/go-mod /scratch/go-cache /scratch/go /scratch/home\nif [ ! -f /scratch/go-mod-ready ]; then\n    cp -a /opt/go-mod/. /scratch/go-mod/\n    touch /scratch/go-mod-ready\nfi\nexport GOPATH=/scratch/go GOCACHE=/scratch/go-cache GOMODCACHE=/scratch/go-mod\nexport GOTOOLCHAIN=local GOPROXY=off GOSUMDB=off\nexport GOLANGCI_LINT_CACHE=/scratch/golangci-lint\n\ncommand=$1\nshift\ncase \"$command\" in\n    check)\n        : CHECK_CHECK\n        ;;\n    exec)\n        : CHECK_EXEC\n        ;;\n    lint)\n        : CHECK_LINT\n        ;;\n    test)\n        : CHECK_TEST\n        ;;\n    build)\n        : CHECK_BUILD\n        ;;\n    *)\n        : CHECK_*\n        ;;\nesac\n",
+      "lint": "        shellcheck -x -P SCRIPTDIR tests/container/run tests/container/check tests/native/run tests/native/check\n        unset GOPROXY GOSUMDB\n        git config --global --add safe.directory /work\n        git init --quiet --initial-branch=main .\n        git add --all\n        git -c user.name='Container checks' -c user.email=checks@example.invalid \\\n            commit --quiet -m 'Check source snapshot'\n        git remote add origin REPOSITORY\n        go mod verify\n        go mod tidy -diff\n        golangci-lint config verify\n        golangci-lint run\n        go tool govulncheck ./...\n        goreleaser check\n        markdownlint-cli2\n"
+    },
+    "rust-native": {
+      "wrapper": "#!/bin/sh\nset -eu\n\nmkdir -p /scratch/cargo /scratch/target /scratch/home\nif [ ! -f /scratch/cargo-ready ]; then\n    cp -a /usr/local/cargo/registry /scratch/cargo/\n    if [ -d /usr/local/cargo/git ]; then\n        cp -a /usr/local/cargo/git /scratch/cargo/\n    fi\n    touch /scratch/cargo-ready\nfi\nexport CARGO_HOME=/scratch/cargo CARGO_TARGET_DIR=/scratch/target\nexport CARGO_HUSKY_DONT_INSTALL_HOOKS=1\n\ncommand=$1\nshift\ncase \"$command\" in\n    check)\n        : CHECK_CHECK\n        ;;\n    exec)\n        : CHECK_EXEC\n        ;;\n    lint)\n        : CHECK_LINT\n        ;;\n    test)\n        : CHECK_TEST\n        ;;\n    build)\n        : CHECK_BUILD\n        ;;\n    *)\n        : CHECK_*\n        ;;\nesac\n",
+      "lint": "        shellcheck -x -P SCRIPTDIR tests/container/run tests/container/check tests/native/run tests/native/check scripts/test-in-container .cargo-husky/hooks/pre-commit\n        cargo fmt --check\n        cargo clippy --locked --offline --all-targets -- -D warnings\n        cargo clippy --locked --offline --all-targets --target aarch64-apple-darwin -- -D warnings\n        cargo deny --all-features check\n        markdownlint-cli2\n",
+      "markdown_extra": "RUN mkdir /opt/cargo-deny      && curl -fsSL https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz      | tar -xz --strip-components=1 -C /opt/cargo-deny"
     }
   },
   "dockerfiles": {
@@ -201,6 +210,59 @@
       "RUN mkdir src && printf 'fn main() {}\\n' > src/main.rs      && cargo fetch --locked      && chmod -R a+rX /usr/local/cargo/registry",
       "COPY tests/container/check /opt/check/run",
       "RUN chmod 755 /opt/check/run"
+    ],
+    "art-kit": [
+      "# syntax=docker/dockerfile:1.25",
+      "FROM koalaman/shellcheck:v0.11.0 AS shellcheck",
+      "FROM node:24.21.0",
+      "RUN mkdir -p /opt/tools /opt/lint /opt/check && chown 19001:19001 /opt/tools /opt/lint",
+      "COPY --from=shellcheck /bin/shellcheck /usr/local/bin/shellcheck",
+      "COPY --chmod=0444 node/package.json /opt/package.json",
+      "COPY --chmod=0555 tests/container/check /opt/check/run",
+      "RUN ln -s /opt/tools/node_modules /deps",
+      "USER 19001:19001",
+      "ENV HOME=/tmp npm_config_cache=/tmp/npm-cache",
+      "WORKDIR /opt/tools",
+      "RUN node --input-type=module -e 'import { readFileSync, writeFileSync } from \"node:fs\"; const p = JSON.parse(readFileSync(\"/opt/package.json\", \"utf8\")); writeFileSync(\"package.json\", JSON.stringify({ private: true, dependencies: { ...p.devDependencies, ...p.peerDependencies } }));'      && npm install --ignore-scripts --no-audit --no-fund      && cd node_modules/skia-canvas      && node lib/prebuild.mjs download",
+      "RUN npm install --prefix /opt/lint --ignore-scripts --no-audit --no-fund markdownlint-cli2@0.24.0",
+      "ENV PATH=/opt/lint/node_modules/.bin:${PATH}",
+      "WORKDIR /work",
+      "ENTRYPOINT [\"/opt/check/run\"]"
+    ],
+    "game-kit": [
+      "# syntax=docker/dockerfile:1.25",
+      "ARG NODE_VERSION=24.21.0",
+      "FROM node:${NODE_VERSION} AS dependencies",
+      "COPY --chown=19001:19001 package.json package-lock.json /opt/check/",
+      "USER 19001:19001",
+      "ENV HOME=/tmp",
+      "RUN mkdir /tmp/dependencies && cp /opt/check/package*.json /tmp/dependencies/ &&      cd /tmp/dependencies && npm ci --ignore-scripts --no-audit --no-fund",
+      "FROM node:${NODE_VERSION}",
+      "ENV HOME=/tmp PATH=\"/opt/check/node_modules/.bin:${PATH}\"",
+      "COPY --from=koalaman/shellcheck:v0.11.0 --chmod=0555 /bin/shellcheck /usr/local/bin/shellcheck",
+      "COPY --from=dependencies /tmp/dependencies/node_modules /opt/check/node_modules",
+      "COPY --chmod=0555 tests/container/check /opt/check/run",
+      "USER 19001:19001",
+      "WORKDIR /work"
     ]
+  },
+  "bridges": {
+    "art-kit": {
+      "helper": "#!/bin/sh\nset -eu\n\ncase \"${1:-}\" in\n    lint)\n        shellcheck -x -P SCRIPTDIR \\\n            tests/container/run tests/container/check \\\n            scripts/check.sh scripts/pack.sh scripts/provision.sh\n        markdownlint-cli2\n        ;;\nesac\n\nexec node /work/tests/container/check.mts \"$@\"\n",
+      "shell_inputs": [
+        "tests/container/run",
+        "tests/container/check",
+        "scripts/check.sh",
+        "scripts/pack.sh",
+        "scripts/provision.sh"
+      ]
+    },
+    "game-kit": {
+      "helper": "#!/bin/sh\nset -eu\n\ncase \"${1:-}\" in\n    lint)\n        shellcheck -x -P SCRIPTDIR tests/container/run tests/container/check\n        markdownlint-cli2\n        shift\n        exec node /work/scripts/container-check.ts lint-features \"$@\"\n        ;;\nesac\n\nexec node /work/scripts/container-check.ts \"$@\"\n",
+      "shell_inputs": [
+        "tests/container/run",
+        "tests/container/check"
+      ]
+    }
   }
 }

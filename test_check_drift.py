@@ -1487,3 +1487,166 @@ class TestContainerProfiles:
         )
         with pytest.raises(ValueError, match="Dockerfile"):
             cd.container_steps({"lint"}, files)
+
+
+class TestContainerFollowup:
+    def test_selected_lint_must_belong_to_the_exported_task_list(self):
+        files = container_files()
+        files["Makefile"] = MAKE_INTERFACE.replace("CHECK_TASKS := lint test build", "CHECK_TASKS := test")
+        with pytest.raises(ValueError, match="absent from CHECK_TASKS"):
+            cd.container_steps({"lint"}, files)
+
+    def test_the_game_node_version_read_is_literal_and_does_not_enable_arbitrary_make_expansion(self):
+        text = MAKE_INTERFACE + "CONTAINER_BUILD_ARGS = NODE_VERSION=$(patsubst v%,%,$(shell cat .nvmrc))\n"
+        assert cd.make_tasks(text)[0] == ["lint", "test", "build"]
+        with pytest.raises(ValueError, match="unsupported expansion"):
+            cd.make_tasks(text.replace("cat .nvmrc", "touch /tmp/override"))
+
+    @staticmethod
+    def bridge_files(name):
+        profiles = json.loads((cd.CANON / "container" / "check-profiles.json").read_text())
+        files = container_files()
+        files["tests/container/check"] = profiles["bridges"][name]["helper"]
+        files["tests/container/Dockerfile"] = "\n".join(profiles["dockerfiles"][name]) + "\n"
+        files["tests/container/context"] += "node/package.json\npackage.json\npackage-lock.json\n"
+        files["package.json"] = json.dumps({"devDependencies": {"markdownlint-cli2": "0.24.0"}})
+        files["package-lock.json"] = json.dumps({"packages": {"node_modules/markdownlint-cli2": {"version": "0.24.0"}}})
+        for path in profiles["bridges"][name]["shell_inputs"]:
+            files.setdefault(path, "#!/bin/sh\nexit 0\n")
+        return files
+
+    @pytest.mark.parametrize("name", ["art-kit", "game-kit"])
+    def test_direct_kit_lint_bridges_run_both_tools_before_node_features(self, name):
+        assert cd.container_steps({"lint"}, self.bridge_files(name)) == {
+            "action-shellcheck",
+            "markdownlint-cli2-action",
+        }
+
+    @pytest.mark.parametrize("name", ["art-kit", "game-kit"])
+    @pytest.mark.parametrize("change", ["masked", "early-exit", "docker", "context", "input"])
+    def test_bridge_coverage_requires_its_unmasked_helper_pinned_image_and_inputs(self, name, change):
+        files = self.bridge_files(name)
+        if change == "masked":
+            files["tests/container/check"] = files["tests/container/check"].replace(
+                "markdownlint-cli2", "markdownlint-cli2 || true"
+            )
+        elif change == "early-exit":
+            files["tests/container/check"] = files["tests/container/check"].replace("set -eu", "set -eu\nexit 0")
+        elif change == "docker":
+            files["tests/container/Dockerfile"] += "RUN printf 'exit 0' > /usr/local/bin/shellcheck\n"
+        elif change == "context":
+            files["tests/container/context"] = "tests/container/check\n"
+        else:
+            del files["tests/container/run"]
+            files["tests/container/run"] = ""
+        with pytest.raises(ValueError, match=r".+"):
+            cd.container_steps({"lint"}, files)
+
+    @pytest.mark.parametrize("name", ["art-kit", "game-kit"])
+    def test_bridge_tool_references_follow_canonical_shellcheck_upgrades(self, monkeypatch, tmp_path, name):
+        files = self.bridge_files(name)
+        canon = tmp_path / "configs"
+        for path in cd.CANON.rglob("*"):
+            if path.is_file():
+                target = canon / path.relative_to(cd.CANON)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(path.read_bytes())
+        shell = canon / "shell" / "shellcheck-step.yml"
+        shell.write_text(shell.read_text().replace("v0.11.0", "v0.12.0"))
+        monkeypatch.setattr(cd, "CANON", canon)
+        with pytest.raises(ValueError, match="canonical ShellCheck"):
+            cd.container_steps({"lint"}, files)
+
+    def test_game_bridge_requires_the_exact_installed_markdown_lock_pin(self):
+        files = self.bridge_files("game-kit")
+        files["package-lock.json"] = files["package-lock.json"].replace("0.24.0", "0.23.2")
+        with pytest.raises(ValueError, match="canonical locked Markdown"):
+            cd.container_steps({"lint"}, files)
+
+    @pytest.mark.parametrize("name", ["art-kit", "game-kit"])
+    def test_bridge_fetches_every_literal_shell_input_and_the_correct_package_manifests(self, monkeypatch, name):
+        files = self.bridge_files(name)
+        patches, calls = repository(files)
+        monkeypatch.setattr(cd, "fetch", patches["fetch"])
+        assert cd.make_findings({"lint"}, "demo") == ([], {"action-shellcheck", "markdownlint-cli2-action"})
+        if name == "game-kit":
+            assert "package.json" in calls
+            assert "package-lock.json" in calls
+            assert "tests/container/package.json" not in calls
+        else:
+            assert "scripts/provision.sh" in calls
+
+    @pytest.mark.parametrize(
+        ("path", "value"),
+        [
+            ("package.json", []),
+            ("package.json", {"devDependencies": []}),
+            ("package-lock.json", []),
+            ("package-lock.json", {"packages": []}),
+        ],
+    )
+    def test_game_bridge_malformed_manifests_report_a_contract_finding(self, monkeypatch, path, value):
+        files = self.bridge_files("game-kit")
+        files[path] = json.dumps(value)
+        patches, _ = repository(files)
+        monkeypatch.setattr(cd, "fetch", patches["fetch"])
+        found, carried = cd.make_findings({"lint"}, "demo")
+        assert len(found) == 1
+        assert found[0][0] == "Make checks"
+        assert carried == set()
+
+    @pytest.mark.parametrize("family", ["go", "rust"])
+    def test_native_shell_helpers_are_checked_by_the_same_direct_lint_gate(self, family):
+        files = profiled_files(family)
+        files["tests/container/check"] = files["tests/container/check"].replace(
+            "tests/container/run tests/container/check",
+            "tests/container/run tests/container/check tests/native/run tests/native/check",
+        )
+        files["tests/native/run"] = files["tests/native/check"] = "#!/bin/sh\nexit 0\n"
+        assert cd.container_steps({"lint"}, files) == {"action-shellcheck", "markdownlint-cli2-action"}
+        del files["tests/native/check"]
+        with pytest.raises(ValueError, match="missing ShellCheck input tests/native/check"):
+            cd.container_steps({"lint"}, files)
+
+    @pytest.mark.parametrize(
+        ("action", "path"),
+        [("setup-docker-action", "docker-setup-step.yml"), ("setup-buildx-action", "setup-buildx-step.yml")],
+    )
+    @pytest.mark.parametrize("guard", [None, "runner.os == 'Linux'", "runner.os == 'macOS'", "false"])
+    def test_bootstrap_pins_allow_only_the_linux_matrix_guard(self, action, path, guard):
+        step = yaml.safe_load((cd.CANON / "container" / path).read_text())[0]
+        if guard is not None:
+            step["if"] = guard
+        text = TestWorkflowFindings.with_steps(
+            "\n".join("      " + line for line in yaml.safe_dump([step], sort_keys=False).splitlines())
+        )
+        found, stepped = cd.workflow_findings("test.yml", text)
+        assert stepped == {action}
+        assert bool(found) == (guard not in (None, "runner.os == 'Linux'"))
+
+    def test_a_correct_first_buildx_step_cannot_hide_a_later_wrong_driver(self):
+        step = (cd.CANON / "container" / "setup-buildx-step.yml").read_text()
+        text = TestWorkflowFindings.with_steps("\n".join("      " + line for line in step.splitlines()))
+        text += "\n  release:\n    timeout-minutes: 15\n    runs-on: ubuntu-latest\n    steps:\n"
+        text += (
+            "\n".join(
+                "      " + line for line in step.replace("driver: docker", "driver: docker-container").splitlines()
+            )
+            + "\n"
+        )
+        found, _ = cd.workflow_findings("test.yml", text)
+        assert [label for label, _ in found] == ["Buildx setup step (test.yml: release, step 1)"]
+
+
+class TestContainerInterfaceOutputs:
+    def test_output_exports_and_empty_admission_preserve_lint_dispatch(self):
+        text = (
+            MAKE_INTERFACE + "TEST_OUTPUTS := coverage.txt\nCHECK_ADMISSION :=\nexport TEST_OUTPUTS CHECK_ADMISSION\n"
+        )
+        assert cd.make_tasks(text)[0] == ["lint", "test", "build"]
+
+
+class TestContainerAdmissionProfile:
+    def test_a_path_alone_does_not_prove_a_host_admission_hook_is_resource_only(self):
+        with pytest.raises(ValueError, match="inspected resource-only"):
+            cd.make_tasks(MAKE_INTERFACE + "CHECK_ADMISSION := scripts/run-tests.sh\nexport CHECK_ADMISSION\n")
