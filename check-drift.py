@@ -1394,6 +1394,8 @@ def harness_steps(targets, repo):
         "tests/container/Dockerfile",
         "tests/source.sh",
         "tests/go/cache.sh",
+        "tests/container/package.json",
+        "tests/container/package-lock.json",
     }
     if repo != "faramir" or not isinstance(reference, dict) or set(reference.get("files", {})) != expected_paths:
         raise ValueError("custom lint harness needs its approved repository-scoped reference")
@@ -1416,12 +1418,49 @@ def harness_steps(targets, repo):
     if (
         f"COPY --from=koalaman/shellcheck:{shell_pin} /bin/shellcheck /usr/local/bin/shellcheck"
         not in docker.splitlines()
-        or re.search(
-            r"npm install --global --ignore-scripts markdownlint-cli2@" + re.escape(markdown_pin) + r"(?=\s|$)", docker
-        )
-        is None
+        or not {
+            "WORKDIR /opt/markdown",
+            "COPY tests/container/package.json tests/container/package-lock.json ./",
+            "RUN npm ci --ignore-scripts --no-audit --no-fund",
+            "COPY --from=node /opt/markdown /opt/markdown",
+            'ENV PATH="/opt/markdown/node_modules/.bin:${PATH}"',
+        }
+        <= set(docker_instructions(docker))
     ):
         raise ValueError("custom lint harness tool pins differ from canon")
+    context = (
+        'tar -C "$root" -cf - tests/container/Dockerfile tests/container/check '
+        "tests/container/package.json tests/container/package-lock.json |"
+    )
+    launcher = files["tests/container/run"].decode().replace("\\\n", " ")
+    if context not in {" ".join(line.split()) for line in launcher.splitlines()}:
+        raise ValueError("custom lint harness must consume its four reviewed Docker context files")
+    manifest = json.loads(files["tests/container/package.json"])
+    lock = json.loads(files["tests/container/package-lock.json"])
+    versions = reference.get("markdownlint-dependencies")
+    if (
+        not isinstance(versions, dict)
+        or set(versions) != {"markdownlint", "katex", "re2js"}
+        or any(not isinstance(version, str) or RELEASE_REF.fullmatch(version) is None for version in versions.values())
+        or not isinstance(manifest, dict)
+        or not isinstance(lock, dict)
+    ):
+        raise ValueError("custom lint harness needs its reviewed Markdown dependency pins")
+    declared = {"markdownlint-cli2": markdown_pin}
+    scoped = {name: versions[name] for name in ("markdownlint", "katex")}
+    packages = lock.get("packages")
+    if (
+        manifest.get("dependencies") != declared
+        or manifest.get("overrides") != {"markdownlint-cli2@" + markdown_pin: scoped}
+        or not isinstance(packages, dict)
+        or not isinstance(packages.get(""), dict)
+        or packages[""].get("dependencies") != declared
+    ):
+        raise ValueError("custom lint harness tool pins differ: Markdown declarations or scoped overrides")
+    for name, version in {**declared, **versions}.items():
+        package = packages.get("node_modules/" + name)
+        if not isinstance(package, dict) or package.get("version") != version:
+            raise ValueError(f"custom lint harness needs locked {name} {version}")
     return {"action-shellcheck", "markdownlint-cli2-action"}
 
 

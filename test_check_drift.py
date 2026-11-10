@@ -2313,14 +2313,14 @@ class TestFrozenHarness:
 
         monkeypatch.setattr(cd, "fetch", unexpected)
         assert cd.make_findings({target}, "faramir") == ([], {"action-shellcheck", "markdownlint-cli2-action"})
-        assert len(calls) == 8
+        assert len(calls) == 10
         assert calls[0] == "repos/andornaut/faramir/git/trees/HEAD?recursive=1"
         assert all("/git/blobs/" in endpoint for endpoint in calls[1:])
         assert all("context" not in endpoint for endpoint in calls)
 
-    @pytest.mark.parametrize("index", range(5))
+    @pytest.mark.parametrize("index", range(7))
     @pytest.mark.parametrize("change", ["blob", "symlink", "mode", "missing"])
-    def test_all_five_frozen_files_must_match_before_any_content_read(self, monkeypatch, index, change):
+    def test_all_seven_frozen_files_must_match_before_any_content_read(self, monkeypatch, index, change):
         tree, blobs = self.inputs()
         entry = tree["tree"][index]
         if change == "blob":
@@ -2337,7 +2337,7 @@ class TestFrozenHarness:
         assert carried == set()
         assert len(calls) == 1
 
-    @pytest.mark.parametrize("index", range(5))
+    @pytest.mark.parametrize("index", range(7))
     def test_frozen_source_bytes_are_checked_even_at_the_approved_blob_endpoint(self, monkeypatch, index):
         tree, blobs = self.inputs()
         blobs[tree["tree"][index]["sha"]] = b"exit 0\n"
@@ -2762,3 +2762,84 @@ class TestStagedContainer:
         monkeypatch.setattr(cd.subprocess, "run", run)
         with pytest.raises(cd.GhError, match="nontruncated"):
             TestCheck.run(monkeypatch, staged_files())
+
+
+class TestFrozenMarkdownSecurity:
+    @staticmethod
+    def verified_files(monkeypatch):
+        reference = json.loads((cd.CANON / "container" / "harnesses.json").read_text())["faramir"]
+        files = {path: entry["content"].encode() for path, entry in reference["files"].items()}
+        files.update({"Makefile": FARAMIR_MAKE.encode(), ".nvmrc": b"v24.21.0\n"})
+        monkeypatch.setattr(cd, "reference_files", lambda *args: files)
+        return files
+
+    @pytest.mark.parametrize("path", ["tests/container/package.json", "tests/container/package-lock.json"])
+    def test_missing_security_manifests_prevent_all_content_reads(self, monkeypatch, path):
+        tree, blobs = TestFrozenHarness.inputs()
+        tree["tree"] = [entry for entry in tree["tree"] if entry["path"] != path]
+        calls = TestFrozenHarness.install(monkeypatch, tree, blobs)
+        found, carried = cd.make_findings({"lint"}, "faramir")
+        assert len(found) == 1
+        assert carried == set()
+        assert len(calls) == 1
+
+    @pytest.mark.parametrize("kind", ["declarations", "scoped", "locked-library", "locked-katex", "locked-re2js"])
+    def test_verified_files_still_require_the_reviewed_security_dependency_chain(self, monkeypatch, kind):
+        files = self.verified_files(monkeypatch)
+        path = (
+            "tests/container/package.json"
+            if kind in {"declarations", "scoped"}
+            else "tests/container/package-lock.json"
+        )
+        document = json.loads(files[path])
+        if kind == "declarations":
+            document["dependencies"]["markdownlint-cli2"] = "0.23.0"
+        elif kind == "scoped":
+            document["overrides"] = {"markdownlint": "0.42.1", "katex": "0.19.1"}
+        else:
+            name = {"locked-library": "markdownlint", "locked-katex": "katex", "locked-re2js": "re2js"}[kind]
+            document["packages"]["node_modules/" + name]["version"] = "0.0.0"
+        files[path] = json.dumps(document).encode()
+        found, carried = cd.make_findings({"lint"}, "faramir")
+        assert len(found) == 1
+        assert carried == set()
+
+    @pytest.mark.parametrize(
+        ("path", "before", "after"),
+        [
+            (
+                "tests/container/run",
+                "tests/container/package.json tests/container/package-lock.json |",
+                "tests/container/package.json |",
+            ),
+            (
+                "tests/container/Dockerfile",
+                "COPY tests/container/package.json tests/container/package-lock.json ./",
+                "COPY tests/container/package.json ./",
+            ),
+            (
+                "tests/container/Dockerfile",
+                "RUN npm ci --ignore-scripts --no-audit --no-fund",
+                "RUN npm install --no-audit --no-fund",
+            ),
+            (
+                "tests/container/Dockerfile",
+                "COPY --from=node /opt/markdown /opt/markdown",
+                "COPY --from=node /opt/markdown /unused",
+            ),
+            (
+                "tests/container/Dockerfile",
+                'ENV PATH="/opt/markdown/node_modules/.bin:${PATH}"',
+                "ENV PATH=/unused:${PATH}",
+            ),
+        ],
+    )
+    def test_reviewed_files_must_consume_the_lock_and_expose_its_installed_tools(
+        self, monkeypatch, path, before, after
+    ):
+        files = self.verified_files(monkeypatch)
+        assert before.encode() in files[path]
+        files[path] = files[path].replace(before.encode(), after.encode())
+        found, carried = cd.make_findings({"lint"}, "faramir")
+        assert len(found) == 1
+        assert carried == set()
