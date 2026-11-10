@@ -3120,3 +3120,117 @@ class TestNativeNodeProfiles:
         )
         with pytest.raises(ValueError, match="container"):
             cd.container_steps({"lint"}, files)
+
+    @pytest.mark.parametrize("root", ["lint", "internal:lint"])
+    @pytest.mark.parametrize("leaf", ["node tools/noop.mjs", "vite build", "jest"])
+    def test_lint_context_survives_unrelated_recursive_alias_names(self, root, leaf):
+        files = self.files()
+        manifest = json.loads(files["package.json"])
+        manifest["scripts"].update(
+            {
+                root: "npm run prepare-tools && markdownlint-cli2",
+                "prepare-tools": "npm run prepare-dependencies",
+                "prepare-dependencies": leaf,
+            }
+        )
+        files["package.json"] = json.dumps(manifest)
+        with pytest.raises(ValueError, match="unmasked lint commands"):
+            cd.native_node_steps([("npm", "run", root)], files)
+
+    def test_lint_aliases_can_reach_the_actual_frozen_markdown_tool(self):
+        files = self.files()
+        manifest = json.loads(files["package.json"])
+        manifest["scripts"].update({"lint": "npm run prepare-tools", "prepare-tools": "markdownlint-cli2"})
+        files["package.json"] = json.dumps(manifest)
+        assert cd.native_node_steps([("npm", "run", "lint")], files) == {"markdownlint-cli2-action"}
+
+    @pytest.mark.parametrize("root", ["test", "build", "internal:test", "internal:build"])
+    @pytest.mark.parametrize("probe", ["vitest --version", "tsc --help", "jest --listTests", "vitest list"])
+    def test_test_and_build_aliases_must_not_be_informational_probes(self, root, probe):
+        files = self.files()
+        manifest = json.loads(files["package.json"])
+        manifest["scripts"].update({root: "npm run inspect-tool", "inspect-tool": probe})
+        files["package.json"] = json.dumps(manifest)
+        with pytest.raises(ValueError, match="informational probes"):
+            cd.native_node_steps([("npm", "run", root)], files)
+
+    @pytest.mark.parametrize("root", ["test", "build"])
+    def test_forwarded_information_options_cannot_replace_actual_gate_execution(self, root):
+        with pytest.raises(ValueError, match="informational probes"):
+            cd.native_node_steps([("npm", "run", root, "--", "--version")], self.files())
+
+    def test_native_builds_preserve_the_inspected_local_dry_run_commands(self):
+        files = self.files()
+        manifest = json.loads(files["package.json"])
+        manifest["scripts"].update(
+            {
+                "build": "vite build && node tools/retain-assets.mjs",
+                "deploy:wrangler:dry-run": "npm run internal:wrangler",
+                "internal:wrangler": "wrangler deploy --config wrangler.jsonc --no-bundle --dry-run",
+                "deploy:prebuilt:dry-run": "npm run internal:cloudflare",
+                "internal:cloudflare": "cf deploy --prebuilt --mode production --dry-run",
+            }
+        )
+        files["tools/retain-assets.mjs"] = "export {};\n"
+        files["package.json"] = json.dumps(manifest)
+        assert (
+            cd.native_node_steps(
+                [
+                    ("npm", "run", "build"),
+                    ("npm", "run", "deploy:wrangler:dry-run"),
+                    ("npm", "run", "deploy:prebuilt:dry-run"),
+                ],
+                files,
+            )
+            == set()
+        )
+        manifest["scripts"]["internal:wrangler"] = "wrangler deploy --config wrangler.jsonc --no-bundle"
+        files["package.json"] = json.dumps(manifest)
+        with pytest.raises(ValueError, match="native test or build tool"):
+            cd.native_node_steps([("npm", "run", "deploy:wrangler:dry-run")], files)
+
+    def test_shellcheck_version_does_not_replace_actual_source_lint(self):
+        files = self.files()
+        manifest = json.loads(files["package.json"])
+        manifest["scripts"]["lint"] = "shellcheck --version && markdownlint-cli2"
+        files["package.json"] = json.dumps(manifest)
+        assert cd.native_node_steps([("npm", "run", "lint")], files) == {"markdownlint-cli2-action"}
+        assert cd.native_node_steps([("shellcheck", "--version")], files) == set()
+
+    def test_literal_shellcheck_separator_and_explicit_sh_mode_prove_source_inputs(self):
+        files = self.files()
+        files["tests/container/admit"] = "#!/bin/sh\nexit 0\n"
+        files[".husky/pre-commit"] = "npx lint-staged\n"
+        manifest = json.loads(files["package.json"])
+        manifest["scripts"].update(
+            {
+                "lint": "npm run internal:lint",
+                "internal:lint": (
+                    "shellcheck --version && shellcheck -- tests/container/run tests/container/check "
+                    "tests/container/admit"
+                    " && shellcheck --shell=sh -- .husky/pre-commit"
+                    " && prettier --check . && eslint --max-warnings 0 . && markdownlint-cli2"
+                ),
+            }
+        )
+        files["package.json"] = json.dumps(manifest)
+        assert cd.native_node_steps([("npm", "run", "lint")], files) == {
+            "action-shellcheck",
+            "markdownlint-cli2-action",
+        }
+        del files[".husky/pre-commit"]
+        with pytest.raises(ValueError, match="missing ShellCheck input"):
+            cd.native_node_steps([("npm", "run", "lint")], files)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            ("shellcheck", "--"),
+            ("shellcheck", "--shell=sh", "--"),
+            ("shellcheck", "--shell=sh", "--", "../outside.sh"),
+            ("shellcheck", "--exclude=SC2086", "--", "tests/container/check"),
+        ],
+    )
+    def test_shellcheck_source_proof_rejects_empty_missing_and_masked_input_profiles(self, command):
+        with pytest.raises(ValueError, match="ShellCheck"):
+            cd.native_node_steps([command], self.files())

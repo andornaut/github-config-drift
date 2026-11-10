@@ -1083,8 +1083,19 @@ def native_node_steps(commands, files):
         raise TypeError("Node lint manifests must declare their native scripts")
     scripts = manifest["scripts"]
     carried = set()
+    information_options = {
+        "--version",
+        "--help",
+        "-v",
+        "-V",
+        "-h",
+        "--showConfig",
+        "--show-config",
+        "--listTests",
+        "--listFilesOnly",
+    }
 
-    def script_steps(name, stack=()):
+    def script_steps(name, stack=(), gate=None, arguments=()):
         if (
             name in stack
             or not isinstance(scripts.get(name), str)
@@ -1092,6 +1103,11 @@ def native_node_steps(commands, files):
         ):
             raise ValueError(f"Node {name} must be a direct, unmasked script without lifecycle overrides")
         text = scripts[name]
+        lint_names = {"lint", "check", "check:types"}
+        if gate == "lint" or name.removeprefix("internal:") in lint_names:
+            gate = "lint"
+        if any(word.partition("=")[0] in information_options for word in arguments):
+            raise ValueError("Node test and build tasks must execute checks, not informational probes")
         if name.removeprefix("internal:") in {"check", "check:types"} and text != (
             "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json"
         ):
@@ -1105,9 +1121,9 @@ def native_node_steps(commands, files):
                     words[3] != "--" or any(not re.fullmatch(r"[-A-Za-z0-9_./=:]+", w) for w in words[4:])
                 ):
                     raise ValueError("Node nested script arguments must be literal")
-                if words[2].removeprefix("internal:") in {"lint", "check", "check:types"} and words[3:]:
+                if (gate == "lint" or words[2].removeprefix("internal:") in lint_names) and words[3:]:
                     raise ValueError("Node lint arguments must not override the inspected command")
-                script_steps(words[2], (*stack, name))
+                script_steps(words[2], (*stack, name), gate, words[4:] if words[3:] else ())
             elif command == "markdownlint-cli2":
                 version = json.loads((CANON / "container" / "tools.json").read_text())["markdownlint-cli2"]
                 dependencies = manifest.get("devDependencies", {})
@@ -1121,17 +1137,24 @@ def native_node_steps(commands, files):
                 ):
                     raise ValueError(f"Node lint must install locked markdownlint-cli2 {version}")
                 carried.add("markdownlint-cli2-action")
-            elif command.startswith("shellcheck -x -P SCRIPTDIR "):
+            elif words[:1] == ["shellcheck"]:
                 shell_steps(words)
             elif command in {"prettier --check .", "eslint --max-warnings 0 ."}:
                 pass
-            elif name.removeprefix("internal:") in {"lint", "check", "check:types"}:
+            elif gate == "lint":
                 if command not in {
                     "svelte-kit sync",
                     "svelte-check --tsconfig ./tsconfig.json",
                 }:
                     raise ValueError(f"Node {name} must contain direct, unmasked lint commands")
-            elif command == "rm -rf web-ext-artifacts/*" and name == "package":
+            elif any(word.partition("=")[0] in information_options for word in words[1:]) or (
+                words[:1] in (["vitest"], ["vite"], ["web-ext"]) and words[1:2] in (["list"], ["help"], ["version"])
+            ):
+                raise ValueError("Node test and build tasks must execute checks, not informational probes")
+            elif command in {
+                "wrangler deploy --config wrangler.jsonc --no-bundle --dry-run",
+                "cf deploy --prebuilt --mode production --dry-run",
+            } or (command == "rm -rf web-ext-artifacts/*" and name == "package"):
                 pass
             elif (
                 not words
@@ -1155,10 +1178,25 @@ def native_node_steps(commands, files):
                 raise ValueError(f"Node {name} must invoke a native test or build tool")
 
     def shell_steps(words):
-        if words[:4] != ["shellcheck", "-x", "-P", "SCRIPTDIR"] or len(words) < 5:
+        if words == ["shellcheck", "--version"]:
+            return
+        if words[:4] == ["shellcheck", "-x", "-P", "SCRIPTDIR"]:
+            paths = words[4:]
+        elif words[:2] == ["shellcheck", "--"]:
+            paths = words[2:]
+        elif words[:3] == ["shellcheck", "--shell=sh", "--"]:
+            paths = words[3:]
+        else:
             raise ValueError("Node ShellCheck must use direct, literal inputs")
-        for path in words[4:]:
-            if not re.fullmatch(r"[A-Za-z0-9_./-]+", path) or not files.get(path):
+        if not paths:
+            raise ValueError("Node ShellCheck must name source inputs")
+        for path in paths:
+            if (
+                not re.fullmatch(r"[A-Za-z0-9_./-]+", path)
+                or path.startswith("/")
+                or ".." in path.split("/")
+                or not files.get(path)
+            ):
                 raise ValueError(f"missing ShellCheck input {path}")
         carried.add("action-shellcheck")
 
@@ -1169,7 +1207,7 @@ def native_node_steps(commands, files):
                 raise ValueError("Node task arguments must be literal")
             if words[2].removeprefix("internal:") in {"lint", "check", "check:types"} and words[3:]:
                 raise ValueError("Node lint arguments must not override the inspected command")
-            script_steps(words[2])
+            script_steps(words[2], arguments=words[4:] if words[3:] else ())
         elif words[:1] == ["shellcheck"]:
             shell_steps(words)
         else:
