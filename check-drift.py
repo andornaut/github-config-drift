@@ -1042,11 +1042,6 @@ def go_module_without_tools(text):
 
 def helper_profile(text):
     """Recognize fixed dispatch wrappers and inspect their selected lint body."""
-    profiles = json.loads((CANON / "container" / "check-profiles.json").read_text())["helpers"]
-    for name in ("node-check", "node-check-svelte"):
-        match = re.search(r"^check\)\n(.*?)^    ;;$", text, re.MULTILINE | re.DOTALL)
-        if match and text[: match.start(1)] + "    : CHECK_CHECK\n" + text[match.end(1) :] == profiles[name]["wrapper"]:
-            return name, [line.strip() for line in match[1].splitlines() if line.strip()]
     if "\nrun_task() {\n" not in text and 'command=$1\nshift\ncase "$command" in' not in text:
         return None, None
     profiles = json.loads((CANON / "container" / "check-profiles.json").read_text())["helpers"]
@@ -1067,7 +1062,7 @@ def helper_profile(text):
             for match in matches:
                 if match[1] != "lint" and any(
                     not re.fullmatch(
-                        r'npm run (?:internal:)?[a-z0-9:-]+(?: -- [a-zA-Z0-9_./=$@" -]+)?',
+                        r'npm run (?:internal:)?[a-z0-9:-]+(?: -- [a-zA-Z0-9_./=$@" -]+)?(?: "\$@")?',
                         line.strip(),
                     )
                     for line in match[2].splitlines()
@@ -1202,7 +1197,15 @@ def node_container_steps(commands, files):
     shell = "shellcheck -x -P SCRIPTDIR tests/container/run tests/container/check"
     if not commands or commands[0] != shell:
         raise ValueError("Node lint must run direct ShellCheck and native npm commands")
-    return native_node_steps([tuple(command.split()) for command in commands], files)
+    carried = native_node_steps([tuple(command.split()) for command in commands], files)
+    helper = files["tests/container/check"]
+    if "\nrun_task() {\n" in helper:
+        for match in re.finditer(r"^    (test|build)\)\n(.*?)^        ;;$", helper, re.MULTILINE | re.DOTALL):
+            commands = [tuple(line.split()) for line in match[2].splitlines() if line.strip()]
+            # The fixed check dispatcher invokes each task without arguments.
+            commands = [command[:-1] if command[-1:] == ('"$@"',) else command for command in commands]
+            native_node_steps(commands, files)
+    return carried
 
 
 def docker_instructions(text):

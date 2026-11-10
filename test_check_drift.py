@@ -1717,7 +1717,7 @@ def profiled_files(profile, markdown=True):
             script += " && markdownlint-cli2"
         files["package.json"] = json.dumps(
             {
-                "scripts": {"internal:lint": script},
+                "scripts": {"internal:lint": script, "internal:test": "jest", "internal:build": "vite build"},
                 "devDependencies": {"markdownlint-cli2": "0.24.0"},
             },
         )
@@ -2988,6 +2988,16 @@ class TestNativeNodeProfiles:
             "build:umd": "esbuild src/index.js --bundle --format=iife --outfile=dist/index.umd.js",
         }
         files["package.json"] = json.dumps(manifest)
+        helper = HELPER_PROFILES["node-native"]["wrapper"]
+        for name, body in {
+            "LINT": (
+                "        shellcheck -x -P SCRIPTDIR tests/container/run tests/container/check\n        npm run lint\n"
+            ),
+            "TEST": '        npm run test -- --runInBand "$@"\n',
+            "BUILD": "        npm run build\n",
+        }.items():
+            helper = helper.replace(f"        : CHECK_{name}\n", body)
+        files["tests/container/check"] = helper
         return files
 
     def test_public_scripts_prove_locked_markdown_without_internal_aliases(self):
@@ -3020,14 +3030,16 @@ class TestNativeNodeProfiles:
         with pytest.raises(ValueError, match="locked markdownlint"):
             cd.native_node_steps([("npm", "run", "lint")], files)
 
-    @pytest.mark.parametrize("profile", ["node-check", "node-check-svelte"])
-    def test_single_check_helper_proves_public_native_commands(self, profile):
+    @pytest.mark.parametrize("profile", ["node-native", "node-native-svelte"])
+    def test_native_helper_proves_public_native_commands(self, profile):
         files = self.files()
-        body = (
-            "    shellcheck -x -P SCRIPTDIR tests/container/run tests/container/check\n"
-            "    npm run check:types\n    npm run lint\n    npm run test -- --runInBand\n    npm run build\n"
-        )
-        helper = HELPER_PROFILES[profile]["wrapper"].replace("    : CHECK_CHECK\n", body)
+        helper = files["tests/container/check"]
+        if profile.endswith("svelte"):
+            helper = helper.replace("npm run test -- --runInBand", "npm run test")
+            helper = helper.replace(
+                'export PATH="/work/node_modules/.bin:${PATH}"\n',
+                'export PATH="/work/node_modules/.bin:${PATH}"\nsvelte-kit sync\n',
+            )
         found, commands = cd.helper_profile(helper)
         assert found == profile
         assert cd.node_container_steps(commands, files) == {
@@ -3088,3 +3100,13 @@ class TestNativeNodeProfiles:
         files["package.json"] = json.dumps(manifest)
         with pytest.raises(ValueError, match="type checking"):
             cd.native_node_steps([("npm", "run", "check:types")], files)
+
+    @pytest.mark.parametrize("name", ["internal:test", "internal:build"])
+    def test_legacy_aliases_require_actual_native_scripts(self, name):
+        files = profiled_files("node")
+        manifest = json.loads(files["package.json"])
+        manifest["scripts"][name] = "true"
+        files["package.json"] = json.dumps(manifest)
+        commands = ["shellcheck -x -P SCRIPTDIR tests/container/run tests/container/check", "npm run internal:lint"]
+        with pytest.raises(ValueError, match="native test or build tool"):
+            cd.node_container_steps(commands, files)
