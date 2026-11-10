@@ -105,11 +105,13 @@ what the hook runs. It runs the entries serially because the prettier and eslint
 entries match the same scripts, and two tasks rewriting one file at once lose one
 of the fixes.
 
-`.github/workflows/ai-attributions.yml` is compared byte for byte in every
-repository, rather than by step as the ShellCheck and markdownlint gates are. It is
-the attribution gate's own configuration, so a copy that quietly lost
-`agents-files`, `emdashes` or `fetch-depth` still runs, still reports success, and
-checks less than the others do.
+`.github/workflows/ai-attributions.yml` normally matches canon byte for byte.
+A call-only helper may instead retain its canonical scan job with an explicit
+event-SHA checkout, while one caller owns event admission and cancellation.
+The checker verifies that literal local call, a stable `AI attributions` aggregate
+that always runs and accepts only scan success, and same-SHA release dependencies
+when publishing is present. Unknown graph shapes remain drift. Both forms retain
+the canonical action pins, `agents-files`, `emdashes` and `fetch-depth`.
 
 ## Related
 

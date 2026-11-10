@@ -296,6 +296,285 @@ def compare_bytes(canon_text, repo_text):
     )
 
 
+class WorkflowLoader(yaml.SafeLoader):
+    """Use workflow boolean spelling without changing the general YAML loader."""
+
+
+WorkflowLoader.yaml_implicit_resolvers = {
+    key: [(tag, pattern) for tag, pattern in resolvers if tag != "tag:yaml.org,2002:bool"]
+    for key, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
+
+
+def workflow_mapping(loader, node):
+    mapping = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=True)
+        if not isinstance(key, str) or key in mapping:
+            raise ValueError("workflow mappings require unique string keys")
+        mapping[key] = loader.construct_object(value_node, deep=True)
+    return mapping
+
+
+WorkflowLoader.add_implicit_resolver(
+    "tag:yaml.org,2002:bool", re.compile(r"^(?:true|false)$", re.IGNORECASE), list("tTfF")
+)
+WorkflowLoader.add_constructor("tag:yaml.org,2002:map", workflow_mapping)
+
+
+def workflow_document(text):
+    """Parse literal workflow mappings, rejecting duplicate and nonstring keys."""
+    loader = WorkflowLoader(text)
+    try:
+        document = loader.get_single_data()
+        return document if isinstance(document, dict) else {}
+    finally:
+        loader.dispose()
+
+
+def same_workflow_shape(expected, subject):
+    """Compare workflow values without Python's boolean and numeric coercion."""
+    return json.dumps(expected, sort_keys=True) == json.dumps(subject, sort_keys=True)
+
+
+def workflow_ancestors(jobs):
+    """Resolve literal job dependencies, rejecting unknown jobs and cycles."""
+    dependencies = {}
+    for name, job in jobs.items():
+        if not isinstance(job, dict):
+            raise TypeError(f"job {name} is not a mapping")
+        needs = job.get("needs", [])
+        if isinstance(needs, str):
+            needs = [needs]
+        if not isinstance(needs, list) or not all(isinstance(item, str) for item in needs):
+            raise ValueError(f"job {name} has nonliteral dependencies")
+        dependencies[name] = needs
+    ancestors = {}
+    for name in jobs:
+        seen, pending = set(), list(dependencies[name])
+        while pending:
+            dependency = pending.pop()
+            if dependency == name:
+                raise ValueError(f"job {name} has cyclic dependencies")
+            if dependency not in jobs:
+                raise ValueError(f"job {name} needs unknown job {dependency}")
+            if dependency not in seen:
+                seen.add(dependency)
+                pending.extend(dependencies[dependency])
+        ancestors[name] = seen
+    return ancestors
+
+
+def success_aggregate(dependencies, job):
+    """Recognize only literal, fail-closed result checks for every dependency."""
+    if set(job) != {"name", "needs", "if", "runs-on", "timeout-minutes", "steps"}:
+        return False
+    needs = job["needs"]
+    if isinstance(needs, str):
+        needs = [needs]
+    steps = job["steps"]
+    return (
+        needs == dependencies
+        and job["if"] in ("always()", "${{ always() }}")
+        and job["runs-on"] == "ubuntu-latest"
+        and type(job["timeout-minutes"]) is int
+        and job["timeout-minutes"] == 15
+        and isinstance(steps, list)
+        and len(steps) == 1
+        and isinstance(steps[0], dict)
+        and set(steps[0]) <= {"name", "run"}
+        and steps[0].get("run", "").strip().splitlines()
+        == [f'[ "${{{{ needs.{dependency}.result }}}}" = success ]' for dependency in dependencies]
+    )
+
+
+def attribution_release(checkout_action, workflows, publisher):
+    """A local publisher receives and verifies the event SHA after all gates."""
+    if set(publisher) != {"needs", "if", "uses", "permissions", "with"}:
+        return "publisher has unsupported overrides"
+    if publisher["if"] != (
+        "github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main')"
+    ):
+        return "publisher must retain the push-only success condition"
+    if publisher["permissions"] != {"contents": "write"} or publisher["with"] != {"source_sha": "${{ github.sha }}"}:
+        return "publisher must pass the event SHA with explicit release permissions"
+    path = publisher["uses"]
+    if not isinstance(path, str) or not re.fullmatch(r"\./\.github/workflows/[\w-]+\.ya?ml", path):
+        return "publisher must call a literal local workflow"
+    release = workflow_document(workflows.get(path.removeprefix("./.github/workflows/"), ""))
+    admission = release.get("on")
+    if not isinstance(admission, dict) or set(admission) != {"workflow_call"}:
+        return "release workflow must be call-only"
+    call = admission["workflow_call"]
+    if not isinstance(call, dict) or set(call) != {"inputs"} or set(call["inputs"]) != {"source_sha"}:
+        return "release workflow must declare only the required source_sha input"
+    source = call["inputs"]["source_sha"]
+    if not isinstance(source, dict) or not same_workflow_shape(
+        {"required": True, "type": "string"}, {k: v for k, v in source.items() if k != "description"}
+    ):
+        return "release source_sha must be a required string without a default"
+    if set(release) != {"name", "on", "permissions", "jobs"} or release["permissions"] != {"contents": "read"}:
+        return "release workflow has unsupported token or shell defaults"
+    jobs = release.get("jobs") or {}
+    ancestors = workflow_ancestors(jobs)
+    guard = {
+        "name": "Verify release source",
+        "runs-on": "ubuntu-latest",
+        "timeout-minutes": 15,
+        "steps": [
+            {
+                "name": "Require the validated event revision",
+                "env": {"SOURCE_SHA": "${{ inputs.source_sha }}", "EVENT_SHA": "${{ github.sha }}"},
+                "run": '[ "$SOURCE_SHA" = "$EVENT_SHA" ]',
+            }
+        ],
+    }
+    guards = [name for name, job in jobs.items() if same_workflow_shape(guard, job)]
+    if len(guards) != 1:
+        return "release workflow must verify source_sha against the event SHA"
+    for name, job in jobs.items():
+        if name == guards[0]:
+            continue
+        if guards[0] not in ancestors[name] or job.get("if") not in (
+            "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')",
+            "github.event_name == 'push' && github.ref == 'refs/heads/main'",
+        ):
+            return "each release job must depend on the source guard and retain success gating"
+        if "uses" in job or job.get("continue-on-error") or "defaults" in job or "concurrency" in job:
+            return "release job has unsupported status or shell overrides"
+        checkouts = [step for step in job.get("steps", []) if str(step.get("uses", "")).startswith("actions/checkout@")]
+        if len(checkouts) != 1 or checkouts[0].get("uses") != checkout_action:
+            return "each release job must use the canonical checkout action once"
+        if checkouts[0].get("with", {}).get("ref") != "${{ inputs.source_sha }}":
+            return "each release checkout must use the validated source_sha"
+        if any(step.get("continue-on-error") or "if" in step for step in job.get("steps", [])):
+            return "release steps must run without status overrides"
+    return None
+
+
+def attribution_dag(canon, workflows):
+    """Recognize the bounded call-only attribution contract, not expressions."""
+    target = "./.github/workflows/ai-attributions.yml"
+    documents = {name: workflow_document(text) for name, text in workflows.items()}
+    for name, document in documents.items():
+        if name == "ai-attributions.yml":
+            continue
+        if any(
+            str(step.get("uses", "")).startswith("andornaut/ai-attributions@")
+            for job in (document.get("jobs") or {}).values()
+            if isinstance(job, dict)
+            for step in job.get("steps", [])
+        ):
+            return "the canonical helper must own the only attribution action"
+    callers = [
+        (name, job_id)
+        for name, document in documents.items()
+        for job_id, job in (document.get("jobs") or {}).items()
+        if isinstance(job, dict) and job.get("uses") == target
+    ]
+    if len(callers) != 1:
+        return "call-only helper needs exactly one literal local caller"
+    name, scan_id = callers[0]
+    caller = documents[name]
+    if set(caller) != {"name", "on", "permissions", "concurrency", "jobs"}:
+        return "caller has unsupported workflow defaults or admission fields"
+    admission = caller["on"]
+    if not isinstance(admission, dict) or set(admission) != {"push", "pull_request", "workflow_dispatch"}:
+        return "caller must own branch push, pull request and manual admission"
+    push = admission["push"]
+    if not isinstance(push, dict) or set(push) - {"branches", "tags"} or push.get("branches") != ["**"]:
+        return "caller must admit every branch push without path filters"
+    if admission["pull_request"] not in (None, {}, {"branches": ["main"]}) or admission["workflow_dispatch"] not in (
+        None,
+        {},
+    ):
+        return "caller pull request and manual admission must remain unconditional"
+    if caller["permissions"] != canon["permissions"]:
+        return "caller must retain canonical read permissions"
+    concurrency = caller["concurrency"]
+    tail = "${{" + canon["concurrency"]["group"].split("${{", 1)[1]
+    group = concurrency.get("group", "") if isinstance(concurrency, dict) else ""
+    prefix = group.removesuffix(tail) if isinstance(group, str) and group.endswith(tail) else ""
+    if (
+        not isinstance(concurrency, dict)
+        or set(concurrency) != {"group", "cancel-in-progress"}
+        or concurrency["cancel-in-progress"] is not True
+        or re.fullmatch(r"[\w-]+-", prefix) is None
+    ):
+        return "caller must own canonical event, fork and branch cancellation"
+    jobs = caller["jobs"]
+    ancestors = workflow_ancestors(jobs)
+    if jobs[scan_id] != {"uses": target}:
+        return "attribution call must be unconditional without overrides"
+    aggregates = [job_id for job_id, job in jobs.items() if job.get("name") == "AI attributions"]
+    if len(aggregates) != 1 or not success_aggregate([scan_id], jobs[aggregates[0]]):
+        return "stable AI attributions aggregate must always run and accept only scan success"
+    aggregate_id = aggregates[0]
+    checkout_action = canon["jobs"]["ai-attributions"]["steps"][0]["uses"]
+    for job_id, job in jobs.items():
+        if job_id != scan_id and "uses" not in job:
+            if job.get("continue-on-error") or "defaults" in job or "concurrency" in job:
+                return "validation jobs cannot override failure or shell behavior"
+            if "permissions" in job and job["permissions"] != canon["permissions"]:
+                return "write-permission publishing must use the validated local release workflow"
+            if "if" in job:
+                needs = job.get("needs", [])
+                if isinstance(needs, str):
+                    needs = [needs]
+                if not needs or not success_aggregate(needs, job):
+                    return "conditional validation jobs must check every dependency fail-closed"
+        for step in job.get("steps", []):
+            if step.get("continue-on-error") or step.get("if") not in (None, "always()", "${{ always() }}"):
+                return "validation steps cannot mask failure or skip checks conditionally"
+            if str(step.get("uses", "")).startswith("actions/checkout@") and (
+                step["uses"] != checkout_action or step.get("with", {}).get("ref") != "${{ github.sha }}"
+            ):
+                return "caller checkouts must use the canonical action at the event SHA"
+    publishers = {job_id for job_id, job in jobs.items() if job_id != scan_id and "uses" in job}
+    for job_id in publishers:
+        job = jobs[job_id]
+        if not set(jobs) - publishers <= ancestors[job_id] or aggregate_id not in ancestors[job_id]:
+            return "publisher must depend on the attribution aggregate and every validation job"
+        if push.get("tags") not in (["v[0-9]+.[0-9]+.[0-9]+"], ["v*"], ["**"]):
+            return "publishing caller must admit release tags"
+        complaint = attribution_release(checkout_action, workflows, job)
+        if complaint:
+            return complaint
+    allowed = {(name, node) for node in publishers | {scan_id}}
+    actual = {
+        (workflow_name, node)
+        for workflow_name, document in documents.items()
+        for node, candidate in (document.get("jobs") or {}).items()
+        if isinstance(candidate, dict) and "uses" in candidate
+    }
+    if actual != allowed:
+        return "reusable workflow calls must be the validated scan and publisher nodes"
+    return None
+
+
+def attribution_findings(canon_text, workflows):
+    """Keep exact legacy bytes, or verify the complete call-only contract."""
+    label = ".github/workflows/ai-attributions.yml"
+    text = workflows.get("ai-attributions.yml")
+    if text is None:
+        return [(label, "no attributions workflow")]
+    diff = compare_bytes(canon_text, text)
+    if diff is None:
+        return []
+    try:
+        canon = workflow_document(canon_text)
+        expected = workflow_document(canon_text)
+        expected["on"] = {"workflow_call": None}
+        expected.pop("concurrency")
+        expected["jobs"]["ai-attributions"]["steps"][0]["with"]["ref"] = "${{ github.sha }}"
+        if not same_workflow_shape(expected, workflow_document(text)):
+            return [(label, diff)]
+        complaint = attribution_dag(canon, workflows)
+    except (ValueError, TypeError, KeyError, AttributeError, yaml.YAMLError) as error:
+        complaint = f"invalid literal attribution graph: {error}"
+    return [(label, complaint)] if complaint else []
+
+
 def workflow_step(text, action):
     """The step running `action` out of a workflow, as a dict, or None when absent."""
     document = yaml.safe_load(text)
@@ -1321,17 +1600,13 @@ def check(repo, uses=None):
     elif fetch(repo, "package.json") is not None:
         found.append((".husky/pre-commit", "no commit hook, and the repository has a package.json"))
 
-    # The attributions workflow, byte for byte rather than by step: it is the
-    # gate's own configuration, and a copy that quietly lost agents-files,
-    # emdashes or fetch-depth still runs and still reports success.
+    # Keep this fetch in its existing position. A call-only helper is validated
+    # after its caller bodies arrive, without fetching any workflow twice more.
+    attribution_index = len(found)
+    workflows = {}
     content = fetch(repo, ".github/workflows/ai-attributions.yml")
     if content is not None:
-        canon_text = (CANON / "attributions" / "ai-attributions.yml").read_text()
-        diff = compare_bytes(canon_text, decode(content))
-        if diff:
-            found.append((".github/workflows/ai-attributions.yml", diff))
-    else:
-        found.append((".github/workflows/ai-attributions.yml", "no attributions workflow"))
+        workflows["ai-attributions.yml"] = decode(content)
 
     stepped = set()
     make_targets = set()
@@ -1340,6 +1615,7 @@ def check(repo, uses=None):
         if content is None:
             continue
         text = decode(content)
+        workflows[name] = text
         rows, carried = workflow_findings(name, text)
         found += rows
         stepped |= carried
@@ -1349,6 +1625,9 @@ def check(repo, uses=None):
         if uses is not None:
             for action, version in actions_used(text):
                 uses.setdefault(action, {}).setdefault(version, []).append(repo)
+
+    canon_text = (CANON / "attributions" / "ai-attributions.yml").read_text()
+    found[attribution_index:attribution_index] = attribution_findings(canon_text, workflows)
 
     container_stepped = set()
     if make_targets:

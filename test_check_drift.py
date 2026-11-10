@@ -882,6 +882,342 @@ def repository(files, languages=(), workflows=()):
     return {"fetch": fetch, "holds_language": holds_language, "workflow_names": workflow_names}, calls
 
 
+class TestAttributionDag:
+    HELPER = """name: AI attributions
+"on":
+  workflow_call:
+permissions:
+  contents: read
+jobs:
+  ai-attributions:
+    name: AI attributions
+    runs-on: ubuntu-latest
+    # A scan still going at fifteen has hung rather than completed.
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+      - name: Scan for AI attributions
+        uses: andornaut/ai-attributions@v1
+        with:
+          agents-files: true
+          emdashes: true
+"""
+
+    CALLER = """name: Test
+"on":
+  push:
+    branches: ["**"]
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: CONTRACT_GROUP
+  cancel-in-progress: true
+jobs:
+  attribution-scan:
+    uses: ./.github/workflows/ai-attributions.yml
+  ai-attributions:
+    name: AI attributions
+    needs: attribution-scan
+    if: always()
+    runs-on: ubuntu-latest
+    # A job still going at fifteen has hung rather than completed.
+    timeout-minutes: 15
+    steps:
+      - name: Require scan success
+        run: '[ "${{ needs.attribution-scan.result }}" = success ]'
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - run: echo checked
+  publish:
+    needs: [test, ai-attributions]
+    if: github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main')
+    uses: ./.github/workflows/release.yml
+    permissions:
+      contents: write
+    with:
+      source_sha: ${{ github.sha }}
+"""
+
+    RELEASE = """name: Release
+"on":
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Validated source revision
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  source:
+    name: Verify release source
+    runs-on: ubuntu-latest
+    # A job still going at fifteen has hung rather than completed.
+    timeout-minutes: 15
+    steps:
+      - name: Require the validated event revision
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          EVENT_SHA: ${{ github.sha }}
+        run: '[ "$SOURCE_SHA" = "$EVENT_SHA" ]'
+  dev-release:
+    needs: source
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.source_sha }}
+      - run: echo publish
+"""
+
+    @classmethod
+    def files(cls):
+        group = (
+            "test-${{ github.workflow }}-${{ github.event_name }}-"
+            "${{ github.event.pull_request.head.repo.full_name || github.repository }}-"
+            "${{ github.head_ref || github.ref_name }}"
+        )
+        return {
+            "ai-attributions.yml": cls.HELPER,
+            "test.yml": cls.CALLER.replace("CONTRACT_GROUP", group),
+            "release.yml": cls.RELEASE,
+        }
+
+    @staticmethod
+    def change(files, filename, path, value):
+        tree = yaml.safe_load(files[filename])
+        subject = tree
+        for key in path[:-1]:
+            subject = subject[key]
+        if value is ...:
+            del subject[path[-1]]
+        else:
+            subject[path[-1]] = value
+        files[filename] = yaml.safe_dump(tree, sort_keys=False)
+
+    @staticmethod
+    def findings(files):
+        return cd.attribution_findings((cd.CANON / "attributions" / "ai-attributions.yml").read_text(), files)
+
+    def test_exact_canonical_bytes_retain_the_standalone_contract(self):
+        canon = (cd.CANON / "attributions" / "ai-attributions.yml").read_text()
+        assert self.findings({"ai-attributions.yml": canon}) == []
+
+    def test_call_only_scan_and_same_sha_fail_closed_publisher_are_accepted(self):
+        assert self.findings(self.files()) == []
+
+    def test_call_only_pipeline_without_publication_needs_no_release_workflow(self):
+        files = self.files()
+        self.change(files, "test.yml", ("jobs", "publish"), ...)
+        self.change(files, "test.yml", ("on", "push", "tags"), ...)
+        del files["release.yml"]
+        assert self.findings(files) == []
+
+    def test_unquoted_on_is_read_without_turning_action_booleans_into_strings(self):
+        files = {name: text.replace('"on":', "on:") for name, text in self.files().items()}
+        assert self.findings(files) == []
+
+    @pytest.mark.parametrize(
+        ("path", "value"),
+        [
+            (("jobs", "ai-attributions", "steps", 1, "with", "agents-files"), 1),
+            (("jobs", "ai-attributions", "steps", 0, "with", "persist-credentials"), 0),
+            (("jobs", "ai-attributions", "steps", 0, "with", "fetch-depth"), False),
+            (("jobs", "ai-attributions", "timeout-minutes"), 15.0),
+        ],
+    )
+    def test_canonical_scalar_types_cannot_be_replaced_by_equal_python_values(self, path, value):
+        files = self.files()
+        self.change(files, "ai-attributions.yml", path, value)
+        assert self.findings(files)
+
+    @pytest.mark.parametrize("filename", ["ai-attributions.yml", "test.yml", "release.yml"])
+    def test_a_literal_boolean_key_cannot_stand_in_for_event_admission(self, filename):
+        files = self.files()
+        files[filename] = files[filename].replace('"on":', "true:")
+        assert self.findings(files)
+
+    def test_duplicate_keys_cannot_hide_a_different_scan_setting(self):
+        files = self.files()
+        files["ai-attributions.yml"] = self.HELPER.replace(
+            "agents-files: true", "agents-files: false\n          agents-files: true"
+        )
+        assert self.findings(files)
+
+    def test_the_workflow_parser_does_not_change_other_yaml_boolean_resolution(self):
+        assert "on" in cd.workflow_document("on:\n  workflow_call:\n")
+        assert True in yaml.safe_load("on:\n  workflow_call:\n")
+
+    @pytest.mark.parametrize(
+        "call",
+        ["./.github/workflows/release.yml", "andornaut/faramir/.github/workflows/release.yml@main"],
+    )
+    def test_release_has_no_other_entrypoint_callers(self, call):
+        files = self.files()
+        files["bypass.yml"] = """name: Other publisher
+"on":
+  push:
+jobs:
+  publish:
+    uses: ./.github/workflows/release.yml
+    permissions:
+      contents: write
+    with:
+      source_sha: ${{ github.sha }}
+"""
+        files["bypass.yml"] = files["bypass.yml"].replace("./.github/workflows/release.yml", call)
+        assert self.findings(files)
+
+    @pytest.mark.parametrize(
+        ("filename", "path"),
+        [
+            ("test.yml", ("jobs", "test", "concurrency")),
+            ("release.yml", ("concurrency",)),
+            ("release.yml", ("jobs", "dev-release", "concurrency")),
+        ],
+    )
+    def test_the_entrypoint_owns_all_cancellation(self, filename, path):
+        files = self.files()
+        self.change(files, filename, path, yaml.safe_load(files["test.yml"])["concurrency"])
+        assert self.findings(files)
+
+    @pytest.mark.parametrize(
+        ("path", "value"),
+        [
+            (("jobs", "ai-attributions", "steps", 1, "with", "agents-files"), False),
+            (("jobs", "ai-attributions", "steps", 1, "with", "emdashes"), False),
+            (("jobs", "ai-attributions", "steps", 1, "uses"), "andornaut/ai-attributions@v2"),
+            (("jobs", "ai-attributions", "steps", 0, "with", "fetch-depth"), 1),
+            (("jobs", "ai-attributions", "steps", 0, "with", "persist-credentials"), True),
+            (("jobs", "ai-attributions", "steps", 0, "with", "ref"), "main"),
+            (("jobs", "ai-attributions", "continue-on-error"), True),
+            (("on", "push"), None),
+            (("concurrency",), {"group": "caller", "cancel-in-progress": True}),
+        ],
+    )
+    def test_helper_deltas_cannot_weaken_the_canonical_scan(self, path, value):
+        files = self.files()
+        self.change(files, "ai-attributions.yml", path, value)
+        assert self.findings(files)
+
+    @pytest.mark.parametrize(
+        ("path", "value"),
+        [
+            (("on", "push", "paths"), ["src/**"]),
+            (("on", "push", "branches"), ["main"]),
+            (("on", "push", "tags"), ...),
+            (("on", "pull_request"), ...),
+            (("on", "workflow_dispatch"), ...),
+            (("permissions", "contents"), "write"),
+            (("concurrency", "cancel-in-progress"), False),
+            (("concurrency", "group"), "test-${{ github.ref }}"),
+            (("jobs", "attribution-scan", "if"), "false"),
+            (("jobs", "attribution-scan", "continue-on-error"), True),
+            (("jobs", "attribution-scan", "uses"), "owner/repo/.github/workflows/ai-attributions.yml@main"),
+            (("jobs", "ai-attributions", "name"), "Optional scan"),
+            (("jobs", "ai-attributions", "if"), "!cancelled()"),
+            (("jobs", "ai-attributions", "needs"), "test"),
+            (("jobs", "ai-attributions", "steps", 0, "run"), "true"),
+            (("jobs", "ai-attributions", "steps", 0, "if"), "false"),
+            (("jobs", "ai-attributions", "continue-on-error"), True),
+            (("jobs", "test", "steps", 0, "with", "ref"), "main"),
+            (("jobs", "test", "steps", 1, "continue-on-error"), True),
+            (("jobs", "test", "if"), "false"),
+            (("jobs", "test", "needs"), "missing"),
+            (("jobs", "test", "needs"), "test"),
+            (("jobs", "publish", "needs"), ["test"]),
+            (("jobs", "publish", "needs"), ["ai-attributions"]),
+            (("jobs", "publish", "if"), "always()"),
+            (("jobs", "publish", "with", "source_sha"), "${{ github.ref }}"),
+            (("jobs", "publish", "uses"), "owner/repo/.github/workflows/release.yml@main"),
+        ],
+    )
+    def test_caller_must_prove_admission_same_sha_and_failure_propagation(self, path, value):
+        files = self.files()
+        self.change(files, "test.yml", path, value)
+        assert self.findings(files)
+
+    @pytest.mark.parametrize(
+        ("path", "value"),
+        [
+            (("on", "push"), None),
+            (("on", "workflow_call", "inputs", "source_sha", "required"), False),
+            (("on", "workflow_call", "inputs", "source_sha", "default"), "main"),
+            (("jobs", "source", "steps", 0, "run"), "true"),
+            (("jobs", "dev-release", "needs"), ...),
+            (("jobs", "dev-release", "if"), "always()"),
+            (("jobs", "dev-release", "continue-on-error"), True),
+            (("jobs", "dev-release", "steps", 0, "with", "ref"), "main"),
+            (("jobs", "dev-release", "steps", 0, "if"), "false"),
+        ],
+    )
+    def test_release_cannot_change_source_or_bypass_its_guard(self, path, value):
+        files = self.files()
+        self.change(files, "release.yml", path, value)
+        assert self.findings(files)
+
+    def test_an_unreachable_helper_or_a_missing_release_is_reported(self):
+        assert self.findings({"ai-attributions.yml": self.HELPER})
+        files = self.files()
+        del files["release.yml"]
+        assert self.findings(files)
+
+    def test_a_second_caller_or_an_inline_scan_is_rejected(self):
+        files = self.files()
+        files["duplicate.yml"] = files["test.yml"]
+        assert self.findings(files)
+        files = self.files()
+        self.change(files, "test.yml", ("jobs", "test", "steps", 1), {"uses": "andornaut/ai-attributions@v1"})
+        assert self.findings(files)
+
+    def test_transitive_validation_aggregates_must_check_every_result(self):
+        files = self.files()
+        aggregate = {
+            "name": "Validation",
+            "needs": ["test"],
+            "if": "always()",
+            "runs-on": "ubuntu-latest",
+            "timeout-minutes": 15,
+            "steps": [{"run": '[ "${{ needs.test.result }}" = success ]'}],
+        }
+        self.change(files, "test.yml", ("jobs", "validated"), aggregate)
+        self.change(files, "test.yml", ("jobs", "publish", "needs"), ["validated", "ai-attributions"])
+        assert self.findings(files) == []
+        self.change(files, "test.yml", ("jobs", "validated", "steps", 0, "run"), "true")
+        assert self.findings(files)
+
+    def test_check_reuses_fetched_bodies_and_keeps_helper_fetch_position(self, monkeypatch):
+        files = {f".github/workflows/{name}": text for name, text in self.files().items()}
+        findings, calls = TestCheck.run(
+            monkeypatch, files, workflows=("test.yml", "release.yml", "ai-attributions.yml")
+        )
+        assert not any(label == ".github/workflows/ai-attributions.yml" for label, _ in findings)
+        helper = ".github/workflows/ai-attributions.yml"
+        assert calls.index(helper) < calls.index("workflows/")
+        assert calls.count(helper) == 2
+        assert calls.count(".github/workflows/release.yml") == 1
+
+
 class TestCheck:
     """What one repository is asked for, and what comes back."""
 
