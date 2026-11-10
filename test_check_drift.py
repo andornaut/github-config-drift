@@ -1319,11 +1319,9 @@ MAKE_INTERFACE = """.DEFAULT_GOAL := check
 CHECK_TASKS := lint test build
 CONTAINER_BUILD_ARGS := PYTHON_VERSION=$(shell cat .python-version)
 export CHECK_TASKS CONTAINER_BUILD_ARGS
-.PHONY: check check-info lint test build exec
+.PHONY: check lint test build exec
 check lint test build exec:
 \t@./tests/container/run $@
-check-info:
-\t@./tests/container/run info
 """
 
 CONTAINER_HELPER = """#!/bin/sh
@@ -1400,7 +1398,7 @@ class TestMakeWorkflowTargets:
 
 
 class TestMakeTasks:
-    def test_check_info_and_execution_share_literal_task_categories(self):
+    def test_check_aggregates_literal_task_categories(self):
         tasks, _ = cd.make_tasks(MAKE_INTERFACE)
         assert tasks == ["lint", "test", "build"]
 
@@ -1423,7 +1421,6 @@ class TestMakeTasks:
             ("CHECK_TASKS := lint test build", "CHECK_TASKS := lint lint"),
             ("export CHECK_TASKS CONTAINER_BUILD_ARGS", "export CONTAINER_BUILD_ARGS"),
             ("@./tests/container/run $@", "@./tests/container/run $@ || true"),
-            ("@./tests/container/run info", '@printf \'{"version":1,"checks":["lint"]}\''),
             (".DEFAULT_GOAL := check", "SHELL := true"),
             (".DEFAULT_GOAL := check", ".IGNORE:"),
             (".DEFAULT_GOAL := check", "UNRELATED := $(eval lint:;true)"),
@@ -1479,7 +1476,9 @@ class TestContainerSteps:
 
     def test_a_test_only_task_list_carries_no_lint_tool(self):
         files = container_files()
-        files["Makefile"] = MAKE_INTERFACE.replace("CHECK_TASKS := lint test build", "CHECK_TASKS := test")
+        files["Makefile"] = MAKE_INTERFACE.replace("CHECK_TASKS := lint test build", "CHECK_TASKS := test").replace(
+            "check lint test build exec:", "check test exec:"
+        )
         assert cd.container_steps({"check"}, files) == set()
 
     @pytest.mark.parametrize("prerequisite", ["CHECK_TASKS=test", "bypass"])
@@ -2253,11 +2252,9 @@ class TestPlainContainerShellInputs:
 FARAMIR_MAKE = """.DEFAULT_GOAL := check
 CHECK_TASKS := lint test build
 export CHECK_TASKS COMMAND
-.PHONY: check check-info lint test build
+.PHONY: check lint test build
 check:
 \t@tests/container/run check
-check-info:
-\t@tests/container/run info
 lint:
 \t@tests/container/run lint
 test:
@@ -2390,7 +2387,6 @@ class TestFrozenHarness:
             ("CHECK_TASKS := lint test build", "CHECK_TASKS := test"),
             (".DEFAULT_GOAL := check", "SHELL := true"),
             (".DEFAULT_GOAL := check", ".IGNORE:"),
-            ("@tests/container/run info", "@printf forged"),
         ],
     )
     def test_make_dispatch_and_declared_categories_cannot_be_masked_or_overridden(self, monkeypatch, before, after):
@@ -2413,6 +2409,8 @@ class TestFrozenHarness:
     def test_a_check_without_declared_lint_carries_no_lint_coverage(self, monkeypatch):
         tree, blobs = self.inputs(
             makefile=FARAMIR_MAKE.replace("CHECK_TASKS := lint test build", "CHECK_TASKS := test")
+            .replace("lint:\n\t@tests/container/run lint\n", "")
+            .replace("build:\n\t@tests/container/run build\n", "")
         )
         self.install(monkeypatch, tree, blobs)
         assert cd.make_findings({"check"}, "faramir") == ([], set())
@@ -2967,3 +2965,72 @@ class TestGoWithoutModuleTools:
         monkeypatch.setattr(cd, "fetch", patches["fetch"])
         assert cd.make_findings({"lint"}, "example")[1] == {"action-shellcheck", "markdownlint-cli2-action"}
         assert "go.mod" not in calls
+
+
+class TestMakeCheckContract:
+    @staticmethod
+    def check_only():
+        return MAKE_INTERFACE.replace("check lint test build exec:", "check:")
+
+    @pytest.mark.parametrize("aliases", ["", " lint", " lint test build exec"])
+    def test_check_is_the_only_required_automation_target(self, aliases):
+        text = self.check_only().replace("check:\n", "check" + aliases + ":\n")
+        tasks, recipes = cd.make_tasks(text)
+        assert tasks == ["lint", "test", "build"]
+        assert recipes["check"] == ["@./tests/container/run $@"]
+
+    def test_check_without_category_aliases_proves_the_declared_lint_category(self):
+        files = container_files()
+        files["Makefile"] = self.check_only()
+        assert cd.container_steps({"check"}, files) == {"markdownlint-cli2-action"}
+
+    @pytest.mark.parametrize("extra", ["format", "check-info", "staged"])
+    def test_unrelated_targets_have_no_required_dispatch_contract(self, extra):
+        text = self.check_only() + f"{extra}: helper\n\t@printf unrelated\nhelper:\n\t@true\n"
+        assert cd.make_tasks(text)[1][extra] == ["[prerequisites] helper", "@printf unrelated"]
+
+    @pytest.mark.parametrize("target", ["lint", "test", "build"])
+    def test_optional_category_aliases_must_be_declared(self, target):
+        tasks = " ".join(task for task in ("lint", "test", "build") if task != target)
+        text = self.check_only().replace("CHECK_TASKS := lint test build", "CHECK_TASKS := " + tasks)
+        text += f"{target}:\n\t@./tests/container/run $@\n"
+        with pytest.raises(ValueError, match="alias is absent from CHECK_TASKS"):
+            cd.make_tasks(text)
+
+    @pytest.mark.parametrize("declaration", ["", "check:\n", "check:\n\t# no dispatch\n"])
+    def test_a_category_alias_cannot_replace_the_required_check_target(self, declaration):
+        text = self.check_only().replace("check:\n\t@./tests/container/run $@\n", "")
+        text += declaration + "lint:\n\t@./tests/container/run $@\n"
+        with pytest.raises(ValueError, match="check automation target"):
+            cd.make_tasks(text)
+
+    def test_a_workflow_selecting_lint_still_requires_the_optional_alias(self):
+        files = container_files()
+        files["Makefile"] = self.check_only()
+        with pytest.raises(ValueError, match="direct dispatch alias"):
+            cd.container_steps({"lint"}, files)
+
+    def test_the_frozen_harness_requires_a_lint_alias_only_when_selected(self, monkeypatch):
+        text = FARAMIR_MAKE.replace("lint:\n\t@tests/container/run lint\n", "")
+        tree, blobs = TestFrozenHarness.inputs(makefile=text)
+        TestFrozenHarness.install(monkeypatch, tree, blobs)
+        assert cd.make_findings({"check"}, "faramir") == (
+            [],
+            {"action-shellcheck", "markdownlint-cli2-action"},
+        )
+        found, carried = cd.make_findings({"lint"}, "faramir")
+        assert found == [("Make checks", "selected make lint needs its direct dispatch alias")]
+        assert carried == set()
+
+    @pytest.mark.parametrize("target", ["lint", "test", "build"])
+    def test_variable_output_aliases_cannot_define_category_targets(self, target):
+        text = self.check_only() + f"TARGET := {target}\n$(TARGET): build\n"
+        with pytest.raises(ValueError, match="unrelated literal build output"):
+            cd.make_tasks(text)
+
+    @pytest.mark.parametrize("dispatch", ["@true", "@./tests/container/run $@ || true", "@./tests/container/run lint"])
+    def test_check_coverage_still_requires_the_unmasked_aggregate_dispatch(self, dispatch):
+        files = container_files()
+        files["Makefile"] = self.check_only().replace("@./tests/container/run $@", dispatch)
+        with pytest.raises(ValueError, match="custom make check"):
+            cd.container_steps({"check"}, files)

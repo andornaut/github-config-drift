@@ -870,7 +870,7 @@ def make_tasks(text):
         if line.startswith("\t"):
             if not current:
                 raise ValueError("Make recipe has no literal target")
-            if line.rstrip().endswith("\\") and set(current).intersection({"lint", "check-info"}):
+            if line.rstrip().endswith("\\") and "lint" in current:
                 raise ValueError("Make lint recipes must not use line continuations")
             if line.lstrip().startswith("#"):
                 continue
@@ -925,8 +925,8 @@ def make_tasks(text):
             pass
         elif match := re.fullmatch(r"([a-z0-9 /_.-]+):(.*)", line):
             current = tuple(match[1].split())
-            if set(current).intersection({"lint", "check-info"}) and match[2].strip():
-                raise ValueError("Make lint and check-info must dispatch without custom prerequisites")
+            if "lint" in current and match[2].strip():
+                raise ValueError("Make lint must dispatch without custom prerequisites")
             if "$" in match[2]:
                 raise ValueError("Make prerequisites must be literal")
             if any(target in recipes for target in current):
@@ -935,7 +935,7 @@ def make_tasks(text):
                 recipes[target] = ["[prerequisites] " + match[2].strip()] if match[2].strip() else []
         elif match := re.fullmatch(r"\$\(([A-Z_]+)\): [a-z]+", line):
             target = variables.get(match[1])
-            if not target or target in {"lint", "check", "check-info", "Makefile", "GNUmakefile", "makefile"}:
+            if not target or target in {"lint", "test", "build", "check", "Makefile", "GNUmakefile", "makefile"}:
                 raise ValueError("Make aliases must name an unrelated literal build output")
         elif re.fullmatch(r"override (COMMAND|TEST_ARGS) := \$\(value \1\)", line):
             pass
@@ -968,11 +968,13 @@ def make_tasks(text):
             raise ValueError("Make syntax is outside the literal check interface")
     if tasks is None or not exported:
         raise ValueError("Make must declare and export literal CHECK_TASKS")
-    for target in ("lint",):
-        if recipes.get(target) != ["@./tests/container/run $@"]:
-            raise ValueError(f"Make {target} must dispatch directly to tests/container/run")
-    if recipes.get("check-info") != ["@./tests/container/run info"]:
-        raise ValueError("Make check-info must read the same runner task list")
+    if not recipes.get("check"):
+        raise ValueError("Make must declare its check automation target")
+    for target in ("lint", "test", "build"):
+        if target in recipes and target not in tasks:
+            raise ValueError(f"Make {target} alias is absent from CHECK_TASKS")
+    if "lint" in recipes and recipes["lint"] != ["@./tests/container/run $@"]:
+        raise ValueError("Make lint must dispatch directly to tests/container/run")
     return tasks, recipes
 
 
@@ -1117,6 +1119,8 @@ def container_steps(targets, files):
     tasks, recipes = make_tasks(files["Makefile"])
     if "lint" in targets and "lint" not in tasks:
         raise ValueError("selected make lint is absent from CHECK_TASKS")
+    if "lint" in targets and recipes.get("lint") != ["@./tests/container/run $@"]:
+        raise ValueError("selected make lint needs its direct dispatch alias")
     if "lint" not in tasks or not targets.intersection({"lint", "check"}):
         return set()
     if "lint" not in targets and recipes.get("check") != ["@./tests/container/run $@"]:
@@ -1438,10 +1442,11 @@ def harness_steps(targets, repo):
         raise ValueError("custom lint harness needs a literal numeric Node version")
     makefile = files["Makefile"].decode()
     normalized = makefile.replace("\t@tests/container/run lint\n", "\t@./tests/container/run $@\n")
-    normalized = normalized.replace("\t@tests/container/run info\n", "\t@./tests/container/run info\n")
     tasks, recipes = make_tasks(normalized)
     if "lint" in targets and "lint" not in tasks:
         raise ValueError("selected make lint is absent from CHECK_TASKS")
+    if "lint" in targets and recipes.get("lint") != ["@./tests/container/run $@"]:
+        raise ValueError("selected make lint needs its direct dispatch alias")
     if "lint" not in tasks or not targets.intersection({"lint", "check"}):
         return set()
     if "lint" not in targets and recipes.get("check") != ["@tests/container/run check"]:
