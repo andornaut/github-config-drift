@@ -35,3 +35,6 @@ GEMINI.md
 !.claude/
 .claude/*
 !.claude/skills/
+
+# Local release archive output.
+/dist/

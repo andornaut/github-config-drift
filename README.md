@@ -133,11 +133,17 @@ workflow runs it on Mondays at 07:00 UTC, and on a push to `main` touching
 
 ## Developing
 
-- See [requirements-dev.txt](./requirements-dev.txt) for the pinned tooling.
+Make and Docker run the project-owned checks. The container uses the declared
+Python runtime and pinned tooling; only a source snapshot and scratch storage
+are mounted.
 
 ```bash
-pip install -r requirements-dev.txt
-python -m pytest -v      # unit tests
-ruff check .             # lint
-ruff format --check .    # formatting
+make check
+make test TEST_ARGS='-k TestCheck'
+make lint
+make build
+make check-info
 ```
+
+`make check` runs lint, the unit suite and archive packaging. `make build` exports
+its archive under `dist/`; the full gate leaves build artifacts in scratch.
