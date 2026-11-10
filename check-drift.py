@@ -976,6 +976,35 @@ def make_tasks(text):
     return tasks, recipes
 
 
+def go_module_without_tools(text):
+    """Prove the inspected module/go/require subset without evaluating module tools."""
+    # Quoted paths and block comments require a string-aware module parser.
+    if not isinstance(text, str) or any(marker in text for marker in ('"', "`", "/*", "*/")):
+        return False
+    text = re.sub(r"//[^\n]*", "", text)
+    module_path = r"[A-Za-z0-9][A-Za-z0-9._~+/-]*"
+    version = r"v[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?(?:\+[A-Za-z0-9.-]+)?"
+    requirement = module_path + r"\s+" + version
+    module_seen = go_seen = in_require = False
+    for line in (line.strip() for line in text.splitlines()):
+        if not line:
+            continue
+        if in_require:
+            if line == ")":
+                in_require = False
+            elif re.fullmatch(requirement, line) is None:
+                return False
+        elif re.fullmatch(r"module\s+" + module_path, line) and not module_seen:
+            module_seen = True
+        elif re.fullmatch(r"go [0-9]+\.[0-9]+(?:\.[0-9]+)?", line) and not go_seen:
+            go_seen = True
+        elif line == "require (":
+            in_require = True
+        elif re.fullmatch(r"require\s+" + requirement, line) is None:
+            return False
+    return module_seen and go_seen and not in_require
+
+
 def helper_profile(text):
     """Recognize fixed dispatch wrappers and inspect their selected lint body."""
     if "\nrun_task() {\n" not in text and 'command=$1\nshift\ncase "$command" in' not in text:
@@ -1146,6 +1175,11 @@ def container_steps(targets, files):
                 raise ValueError(f"missing ShellCheck input {path}")
         return {"action-shellcheck", "markdownlint-cli2-action"}
     profile, profiled_commands = helper_profile(helper)
+    if profile == "go-no-tools" and (
+        not go_module_without_tools(files.get("go.mod"))
+        or "go.mod" not in files["tests/container/context"].splitlines()
+    ):
+        raise ValueError("the Go lint variant without a module tool requires an inspected tool-free go.mod")
     if profile is not None and profile.startswith("node"):
         return node_container_steps(profiled_commands, files)
     if profile is not None:
@@ -1574,6 +1608,12 @@ def make_findings(targets, repo):
                 return [("Make checks", f"missing {path}")], set()
             files[path] = decode(content)
     try:
+        profile, _ = helper_profile(files["tests/container/check"])
+        if profile == "go-no-tools":
+            content = fetch(repo, "go.mod")
+            if content is None:
+                return [("Make checks", "missing go.mod")], set()
+            files["go.mod"] = decode(content)
         checked_files = {**files, "Makefile": admission_makefile(repo, files["Makefile"])}
         return [], container_steps(targets, checked_files)
     except (ValueError, TypeError, KeyError) as error:

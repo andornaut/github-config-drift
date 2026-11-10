@@ -2843,3 +2843,127 @@ class TestFrozenMarkdownSecurity:
         found, carried = cd.make_findings({"lint"}, "faramir")
         assert len(found) == 1
         assert carried == set()
+
+
+class TestGoWithoutModuleTools:
+    MODULE = "module github.com/andornaut/example\n\ngo 1.27\n\nrequire example.com/tool v1.2.3\n"
+
+    @classmethod
+    def files(cls):
+        files = profiled_files("go")
+        files["tests/container/check"] = files["tests/container/check"].replace(
+            "        go tool govulncheck ./...\n", ""
+        )
+        files["go.mod"] = cls.MODULE
+        files["tests/container/context"] += "go.mod\ngo.sum\n"
+        return files
+
+    def test_the_exact_variant_proves_only_the_direct_shell_and_markdown_tools(self, monkeypatch):
+        files = self.files()
+        patches, calls = repository(files)
+        monkeypatch.setattr(cd, "fetch", patches["fetch"])
+        assert cd.make_findings({"lint"}, "example") == ([], {"action-shellcheck", "markdownlint-cli2-action"})
+        assert calls[-1] == "go.mod"
+
+    @pytest.mark.parametrize(
+        "suffix", ["tool example.com/check\n", "tool (\nexample.com/check\n)\n", "tool/*gap*/example.com/check\n"]
+    )
+    def test_a_declared_module_tool_cannot_use_the_variant_without_its_command(self, suffix):
+        files = self.files()
+        files["go.mod"] += suffix
+        with pytest.raises(ValueError, match=r"tool-free go\.mod"):
+            cd.container_steps({"lint"}, files)
+
+    @pytest.mark.parametrize("module", [None, "", "module example.com/a\n", "go 1.27\n", "/* unterminated\n"])
+    def test_absent_or_uninspected_module_metadata_is_not_a_tool_free_module(self, module):
+        assert not cd.go_module_without_tools(module)
+
+    def test_comments_and_module_path_components_do_not_declare_tools(self):
+        module = "// tool ignored\n" + self.MODULE + "// tool example.com/commented\n"
+        assert cd.go_module_without_tools(module)
+
+    @pytest.mark.parametrize(
+        "syntax", ['replace example.com/a => "./a"\n', "replace example.com/a => `./a`\n", "/* comment */\n"]
+    )
+    def test_quoted_or_block_commented_modules_need_a_separate_inspected_profile(self, syntax):
+        assert not cd.go_module_without_tools(self.MODULE + syntax)
+
+    def test_comment_delimiters_inside_quoted_paths_cannot_hide_a_real_tool(self):
+        module = (
+            self.MODULE
+            + 'replace example.com/a => "./a/*"\n'
+            + "tool golang.org/x/vuln/cmd/govulncheck\n"
+            + 'replace example.com/b => "./b*/"\n'
+        )
+        assert not cd.go_module_without_tools(module)
+
+    @pytest.mark.parametrize(
+        "syntax",
+        [
+            "replace example.com/a => example.com/b v1.2.3\n",
+            "exclude example.com/a v1.2.3\n",
+            "toolchain go1.27.0\n",
+            "unknown directive\n",
+            "require (\nexample.com/a v1.2.3\n",
+            "require (\ntool example.com/check\n)\n",
+            "module example.com/duplicate\n",
+            "go 1.26\n",
+        ],
+    )
+    def test_unknown_directives_or_unclosed_blocks_need_a_separate_profile(self, syntax):
+        assert not cd.go_module_without_tools(self.MODULE + syntax)
+
+    def test_literal_requirement_blocks_and_indirect_comments_remain_supported(self):
+        module = "module example.com/a\ngo 1.27\nrequire (\nexample.com/b v1.2.3 // indirect\n)\n"
+        assert cd.go_module_without_tools(module)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "shellcheck -x -P SCRIPTDIR tests/container/run tests/container/check",
+            "go mod verify",
+            "go mod tidy -diff",
+            "golangci-lint config verify",
+            "golangci-lint run",
+            "goreleaser check",
+            "markdownlint-cli2",
+        ],
+    )
+    @pytest.mark.parametrize("replacement", ["", "true", "COMMAND || true"])
+    def test_no_other_lint_command_can_be_omitted_or_masked(self, command, replacement):
+        files = self.files()
+        files["tests/container/check"] = files["tests/container/check"].replace(
+            "        " + command + "\n", "        " + replacement.replace("COMMAND", command) + "\n"
+        )
+        with pytest.raises(ValueError, match="inspected dispatch profiles"):
+            cd.container_steps({"lint"}, files)
+
+    @pytest.mark.parametrize(
+        ("before", "after"),
+        [("shellcheck:v0.11.0", "shellcheck:v0.10.0"), ("markdownlint-cli2@0.24.0", "markdownlint-cli2@0.23.2")],
+    )
+    def test_the_variant_keeps_the_existing_pinned_docker_profile(self, before, after):
+        files = self.files()
+        files["tests/container/Dockerfile"] = files["tests/container/Dockerfile"].replace(before, after)
+        with pytest.raises(ValueError, match="inspected container instruction profiles"):
+            cd.container_steps({"lint"}, files)
+
+    def test_the_inspected_module_must_also_be_a_build_context_input(self):
+        files = self.files()
+        files["tests/container/context"] = files["tests/container/context"].replace("go.mod\n", "")
+        with pytest.raises(ValueError, match=r"tool-free go\.mod"):
+            cd.container_steps({"lint"}, files)
+
+    def test_a_missing_module_is_reported_without_coverage(self, monkeypatch):
+        files = self.files()
+        del files["go.mod"]
+        patches, _ = repository(files)
+        monkeypatch.setattr(cd, "fetch", patches["fetch"])
+        assert cd.make_findings({"lint"}, "example") == ([("Make checks", "missing go.mod")], set())
+
+    def test_existing_go_profiles_do_not_add_a_module_api_call(self, monkeypatch):
+        files = profiled_files("go")
+        patches, calls = repository(files)
+        monkeypatch.setattr(cd, "fetch", patches["fetch"])
+        assert cd.make_findings({"lint"}, "example")[1] == {"action-shellcheck", "markdownlint-cli2-action"}
+        assert "go.mod" not in calls
