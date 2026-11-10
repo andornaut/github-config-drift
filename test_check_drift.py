@@ -381,6 +381,17 @@ class TestWorkflowShape:
         theirs = theirs.replace("going at fifteen", "going at thirty")
         assert cd.workflow_shape(theirs) == []
 
+    def test_a_cap_may_be_named_numerically_in_its_rationale(self):
+        theirs = SOUND.replace("timeout-minutes: 15", "timeout-minutes: 30")
+        theirs = theirs.replace("going at fifteen", "going at 30 minutes")
+        assert cd.workflow_shape(theirs) == []
+
+    @pytest.mark.parametrize("number", [130, 300])
+    def test_a_numeric_cap_must_be_a_whole_number(self, number):
+        theirs = SOUND.replace("timeout-minutes: 15", "timeout-minutes: 30")
+        theirs = theirs.replace("going at fifteen", f"going at {number} minutes")
+        assert cd.workflow_shape(theirs) == ["the rationale comment does not name the 30 minute cap"]
+
     def test_a_comment_naming_a_cap_the_file_no_longer_declares_is_reported(self):
         theirs = SOUND.replace("timeout-minutes: 15", "timeout-minutes: 30")
         assert cd.workflow_shape(theirs) == ["the rationale comment does not name the 30 minute cap"]

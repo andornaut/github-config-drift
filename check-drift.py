@@ -69,7 +69,7 @@ IGNORE_ALTERNATIVES = {
 
 # The half of the rationale comment that holds whatever the cap is: faramir says
 # "eight minutes" where the rest say "six", so the sentinel cannot name a
-# duration. The cap itself is still checked, against the word below, or the
+# duration. The cap itself is still checked, as a number or the word below, or the
 # comment would be free to name a number the file no longer declares.
 TIMEOUT_RATIONALE = "has hung rather than"
 
@@ -376,9 +376,10 @@ def workflow_shape(text):
         #
         # A comment naming a cap the file no longer declares is worse than none:
         # it reads as a reason and is not one.
-        word = CAP_WORDS.get(next(iter(caps)))
-        if word and word not in comments:
-            complaints.append(f"the rationale comment does not name the {next(iter(caps))} minute cap")
+        cap = next(iter(caps))
+        word = CAP_WORDS.get(cap)
+        if word and word not in comments and not re.search(rf"\b{cap}\b", comments):
+            complaints.append(f"the rationale comment does not name the {cap} minute cap")
 
     # Without a top-level block the workflow takes the repository default, which
     # is read today and is a setting rather than a property of this file.
