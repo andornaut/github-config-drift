@@ -1860,3 +1860,54 @@ class TestAdaResourceAdmission:
         monkeypatch.setattr(cd.subprocess, "run", unexpected)
         with pytest.raises(ValueError, match=r".+"):
             cd.admission_makefile("ada-the-navigator", MAKE_INTERFACE + declaration + "\n")
+
+
+class TestPlainContainerShellInputs:
+    def test_a_direct_legacy_test_wrapper_is_an_additional_shellcheck_input(self, monkeypatch):
+        files = container_files()
+        files["tests/container/check"] = files["tests/container/check"].replace(
+            "        ruff check .",
+            "        shellcheck -x -P SCRIPTDIR tests/container/run tests/container/check "
+            "scripts/test-in-container\n        ruff check .",
+        )
+        files["scripts/test-in-container"] = '#!/bin/sh\nexec ./tests/container/run test "$@"\n'
+        patches, calls = repository(files)
+        monkeypatch.setattr(cd, "fetch", patches["fetch"])
+        assert cd.make_findings({"lint"}, "ai-maintainer") == ([], {"action-shellcheck", "markdownlint-cli2-action"})
+        assert "scripts/test-in-container" in calls
+
+    def test_a_missing_legacy_wrapper_cannot_receive_shellcheck_coverage(self):
+        files = container_files()
+        files["tests/container/check"] = files["tests/container/check"].replace(
+            "        ruff check .",
+            "        shellcheck -x -P SCRIPTDIR tests/container/run tests/container/check "
+            "scripts/test-in-container\n        ruff check .",
+        )
+        with pytest.raises(ValueError, match="missing ShellCheck input scripts/test-in-container"):
+            cd.container_steps({"lint"}, files)
+
+    @pytest.mark.parametrize("suffix", [" || true", "; true", " scripts/uninspected"])
+    def test_an_additional_wrapper_does_not_permit_masking_or_uninspected_inputs(self, suffix):
+        files = container_files()
+        files["tests/container/check"] = files["tests/container/check"].replace(
+            "        ruff check .",
+            "        shellcheck -x -P SCRIPTDIR tests/container/run tests/container/check scripts/test-in-container"
+            + suffix
+            + "\n        ruff check .",
+        )
+        files["scripts/test-in-container"] = "#!/bin/sh\nexit 0\n"
+        with pytest.raises(ValueError, match="direct, unmasked"):
+            cd.container_steps({"lint"}, files)
+
+    @pytest.mark.parametrize("extra_first", [True, False])
+    def test_every_direct_shellcheck_invocation_requires_all_of_its_inputs(self, extra_first):
+        files = container_files()
+        base = "        shellcheck -x -P SCRIPTDIR tests/container/run tests/container/check"
+        extra = base + " scripts/test-in-container"
+        commands = [extra, base] if extra_first else [base, extra]
+        files["tests/container/check"] = files["tests/container/check"].replace(
+            "        ruff check .",
+            "\n".join(commands) + "\n        ruff check .",
+        )
+        with pytest.raises(ValueError, match="missing ShellCheck input scripts/test-in-container"):
+            cd.container_steps({"lint"}, files)

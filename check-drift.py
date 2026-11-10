@@ -885,7 +885,10 @@ def container_steps(targets, files):
         "python tests/container/validate.py",
     }
     shellcheck = "shellcheck -x -P SCRIPTDIR tests/container/run tests/container/check"
-    if not commands or (profile is None and any(command not in allowed | {shellcheck} for command in commands)):
+    supported_shell_commands = {shellcheck, shellcheck + " scripts/test-in-container"}
+    if not commands or (
+        profile is None and any(command not in allowed | supported_shell_commands for command in commands)
+    ):
         raise ValueError("container lint case must contain direct, unmasked supported tool commands")
     if "python tests/container/validate.py" in commands and not files.get("tests/container/validate.py"):
         raise ValueError("missing tests/container/validate.py")
@@ -954,16 +957,17 @@ def container_steps(targets, files):
         if not installed or not wiring <= set(docker[final:]):
             raise ValueError(f"container must install and carry markdownlint-cli2 {pin}")
         carried.add("markdownlint-cli2-action")
-    shell_command = next((command for command in commands if command.startswith("shellcheck -x -P SCRIPTDIR ")), None)
-    if shell_command is not None:
+    shell_commands = [command for command in commands if command.startswith("shellcheck -x -P SCRIPTDIR ")]
+    if shell_commands:
         pin = yaml.safe_load((CANON / "shell" / "shellcheck-step.yml").read_text())[0]["with"]["version"]
         if f"FROM koalaman/shellcheck:{pin} AS shellcheck" not in docker[:final] or (
             "COPY --from=shellcheck /bin/shellcheck /usr/local/bin/shellcheck" not in docker[final:]
         ):
             raise ValueError(f"container must install and carry ShellCheck {pin}")
-        for path in shell_command.split()[4:]:
-            if not files.get(path):
-                raise ValueError(f"missing ShellCheck input {path}")
+        for shell_command in shell_commands:
+            for path in shell_command.split()[4:]:
+                if not files.get(path):
+                    raise ValueError(f"missing ShellCheck input {path}")
         carried.add("action-shellcheck")
     return carried
 
