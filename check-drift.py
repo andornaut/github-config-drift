@@ -1120,7 +1120,7 @@ def container_steps(targets, files):
             raise ValueError("bridge must install the canonical Markdown tool")
         context = set(files["tests/container/context"].splitlines())
         required = {"tests/container/Dockerfile", "tests/container/check"}
-        if name == "game-kit":
+        if name in {"game-kit", "game-dev"}:
             required |= {"package.json", "package-lock.json"}
             manifest = json.loads(files["package.json"])
             lock = json.loads(files["package-lock.json"])
@@ -1425,6 +1425,68 @@ def harness_steps(targets, repo):
     return {"action-shellcheck", "markdownlint-cli2-action"}
 
 
+def container_manifests(text):
+    """Select only the package files explicitly copied into an inspected install."""
+    instructions = docker_instructions(text)
+    root_copies = {
+        "COPY package.json package-lock.json ./",
+        "COPY --chown=19001:19001 package.json package-lock.json ./",
+        "COPY --chown=19001:19001 package.json package-lock.json /opt/check/",
+    }
+    nested_copy = "COPY tests/container/package.json tests/container/package-lock.json ./"
+    root = bool(root_copies.intersection(instructions))
+    nested = nested_copy in instructions
+    if root == nested:
+        raise ValueError("frozen Node install needs one inspected root or nested manifest copy")
+    prefix = "" if root else "tests/container/"
+    return tuple(prefix + name for name in ("package.json", "package-lock.json"))
+
+
+def staged_hooks(repo):
+    """Prove guarded orchestration and its formatter's complete container path."""
+    reference = json.loads((CANON / "container" / "staged.json").read_text())
+    expected = {"tests/container/staged", "tests/container/staged-git"}
+    if not isinstance(reference, dict) or set(reference.get("files", {})) != expected:
+        raise ValueError("staged reference must name both reviewed wrapper files")
+    regular = {
+        "Makefile": "100644",
+        "tests/container/run": "100755",
+        "tests/container/check": "100755",
+        "tests/container/Dockerfile": "100644",
+        "tests/container/context": "100644",
+        "package.json": "100644",
+        "package-lock.json": "100644",
+        ".lintstagedrc": "100644",
+        ".husky/pre-commit": "100755",
+    }
+    files = {path: raw.decode() for path, raw in reference_files("staged formatter", regular, reference, repo).items()}
+    canonical = prettier_entries(json.loads((CANON / "javascript" / "lintstagedrc").read_text()))
+    wrapped = {glob: "./tests/container/staged " + command for glob, command in canonical.items()}
+    if prettier_entries(json.loads(files[".lintstagedrc"])) != wrapped:
+        raise ValueError("staged formatter must preserve the canonical prettier glob and arguments")
+    if files[".husky/pre-commit"] != "./tests/container/staged orchestrate\n":
+        raise ValueError("staged hook must invoke only its guarded serial orchestrator")
+    if container_steps({"lint"}, files) != {"action-shellcheck", "markdownlint-cli2-action"}:
+        raise ValueError("staged formatter needs the complete pinned container lint path")
+    manifest = json.loads(files["package.json"])
+    lock = json.loads(files["package-lock.json"])
+    dependencies = manifest.get("devDependencies", {})
+    packages = lock.get("packages", {})
+    root = packages.get("", {})
+    if not isinstance(root, dict) or not isinstance(root.get("devDependencies"), dict):
+        raise TypeError("staged formatter needs frozen root tool declarations")
+    for tool in ("prettier", "lint-staged", "markdownlint-cli2"):
+        package = packages.get("node_modules/" + tool, {})
+        version = package.get("version") if isinstance(package, dict) else None
+        if (
+            not isinstance(version, str)
+            or re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version) is None
+            or dependencies.get(tool) not in {version, "^" + version, "~" + version}
+            or root.get("devDependencies", {}).get(tool) != dependencies.get(tool)
+        ):
+            raise ValueError(f"staged formatter needs a declared and frozen {tool} tool")
+
+
 def make_findings(targets, repo):
     """Fetch a Make contract only after CI selects its literal check categories."""
     if repo == "faramir":
@@ -1446,13 +1508,10 @@ def make_findings(targets, repo):
             return [("Make checks", f"missing {path}")], set()
         files[path] = decode(content)
     if "npm ci --ignore-scripts --no-audit --no-fund" in files["tests/container/Dockerfile"]:
-        manifests = (
-            ("package.json", "package-lock.json")
-            if "COPY package.json package-lock.json ./" in files["tests/container/Dockerfile"]
-            or "COPY --chown=19001:19001 package.json package-lock.json /opt/check/"
-            in files["tests/container/Dockerfile"]
-            else ("tests/container/package.json", "tests/container/package-lock.json")
-        )
+        try:
+            manifests = container_manifests(files["tests/container/Dockerfile"])
+        except ValueError as error:
+            return [("Make checks", str(error))], set()
         for path in manifests:
             content = fetch(repo, path)
             if content is None:
@@ -1607,26 +1666,41 @@ def check(repo, uses=None):
         if diff:
             found.append(("eslint.config.base.mjs", diff))
 
+    staged_rows = []
+    wrapped_prettier = False
     content = fetch(repo, ".lintstagedrc")
     if content is not None:
         canon = prettier_entries(json.loads((CANON / "javascript" / "lintstagedrc").read_text()))
         theirs = prettier_entries(json.loads(decode(content)))
+        wrapped_prettier = theirs == {glob: "./tests/container/staged " + command for glob, command in canon.items()}
         if canon != theirs:
-            found.append((".lintstagedrc", diff_trees(canon, theirs)))
+            staged_rows.append((".lintstagedrc", diff_trees(canon, theirs)))
     elif fetch(repo, "package.json") is not None:
         # Reported rather than skipped, on the reasoning the step checks share:
         # a repository that never added the hook reads exactly like one whose
         # hook matched.
-        found.append((".lintstagedrc", "no lint-staged config, and the repository has a package.json"))
+        staged_rows.append((".lintstagedrc", "no lint-staged config, and the repository has a package.json"))
 
+    hook_rows = []
     content = fetch(repo, ".husky/pre-commit")
+    wrapped_hook = content is not None and decode(content) == "./tests/container/staged orchestrate\n"
     if content is not None:
         canon_text = (CANON / "javascript" / "husky-pre-commit").read_text()
         diff = compare_bytes(canon_text, decode(content))
         if diff:
-            found.append((".husky/pre-commit", diff))
+            hook_rows.append((".husky/pre-commit", diff))
     elif fetch(repo, "package.json") is not None:
-        found.append((".husky/pre-commit", "no commit hook, and the repository has a package.json"))
+        hook_rows.append((".husky/pre-commit", "no commit hook, and the repository has a package.json"))
+    if wrapped_prettier and wrapped_hook:
+        try:
+            staged_hooks(repo)
+        except (ValueError, TypeError, KeyError, AttributeError) as error:
+            staged_rows = [(".lintstagedrc", f"staged formatter proof: {error}")]
+            hook_rows = [(".husky/pre-commit", f"staged formatter proof: {error}")]
+        else:
+            staged_rows = []
+            hook_rows = []
+    found += staged_rows + hook_rows
 
     # Keep this fetch in its existing position. A call-only helper is validated
     # after its caller bodies arrive, without fetching any workflow twice more.

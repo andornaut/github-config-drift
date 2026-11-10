@@ -26,6 +26,20 @@
     }
   },
   "dockerfiles": {
+    "game-dev": [
+      "# syntax=docker/dockerfile:1.25",
+      "FROM koalaman/shellcheck:v0.11.0 AS shellcheck",
+      "FROM node:24.22.2",
+      "COPY --from=shellcheck /bin/shellcheck /usr/local/bin/shellcheck",
+      "RUN install -d -o 19001 -g 19001 /opt/check",
+      "WORKDIR /opt/check",
+      "COPY --chown=19001:19001 package.json package-lock.json ./",
+      "USER 19001:19001",
+      "ENV HOME=/tmp",
+      "RUN npm ci --ignore-scripts --no-audit --no-fund",
+      "COPY tests/container/check /opt/check/run",
+      "ENV PATH=/opt/check/node_modules/.bin:${PATH}"
+    ],
     "python-direct": [
       "ARG PYTHON_VERSION=3.12",
       "FROM koalaman/shellcheck:v0.11.0 AS shellcheck",
@@ -247,6 +261,15 @@
     ]
   },
   "bridges": {
+    "game-dev": {
+      "helper": "#!/bin/sh\nset -eu\n\ncategory=${1:-check}\nif [ \"$#\" -gt 0 ]; then shift; fi\ncase \"${category}\" in\n    check)\n        for category in ${CHECK_TASKS}; do /opt/check/run \"${category}\"; done\n        ;;\n    lint)\n        shellcheck -x -P SCRIPTDIR tests/container/run tests/container/check tests/container/staged tests/container/staged-git\n        markdownlint-cli2 \"$@\"\n        ;;\n    exec)\n        if [ \"$#\" -gt 0 ]; then exec \"$@\"; fi\n        exec sh -ec \"${COMMAND:?COMMAND is required}\"\n        ;;\n    *)\n        printf 'Unknown check category: %s\\n' \"${category}\" >&2\n        exit 2\n        ;;\nesac\n",
+      "shell_inputs": [
+        "tests/container/run",
+        "tests/container/check",
+        "tests/container/staged",
+        "tests/container/staged-git"
+      ]
+    },
     "art-kit": {
       "helper": "#!/bin/sh\nset -eu\n\ncase \"${1:-}\" in\n    lint)\n        shellcheck -x -P SCRIPTDIR \\\n            tests/container/run tests/container/check \\\n            scripts/check.sh scripts/pack.sh scripts/provision.sh\n        markdownlint-cli2\n        ;;\nesac\n\nexec node /work/tests/container/check.mts \"$@\"\n",
       "shell_inputs": [
