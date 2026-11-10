@@ -273,12 +273,10 @@
   },
   "bridges": {
     "game-dev": {
-      "helper": "#!/bin/sh\nset -eu\n\ncategory=${1:-check}\nif [ \"$#\" -gt 0 ]; then shift; fi\ncase \"${category}\" in\n    check)\n        for category in ${CHECK_TASKS}; do /opt/check/run \"${category}\"; done\n        ;;\n    lint)\n        shellcheck -x -P SCRIPTDIR tests/container/run tests/container/check tests/container/staged tests/container/staged-git\n        markdownlint-cli2 \"$@\"\n        ;;\n    exec)\n        if [ \"$#\" -gt 0 ]; then exec \"$@\"; fi\n        exec sh -ec \"${COMMAND:?COMMAND is required}\"\n        ;;\n    *)\n        printf 'Unknown check category: %s\\n' \"${category}\" >&2\n        exit 2\n        ;;\nesac\n",
+      "helper": "#!/bin/sh\nset -eu\n\ncategory=${1:-check}\nif [ \"$#\" -gt 0 ]; then shift; fi\ncase \"${category}\" in\n    check)\n        for category in ${CHECK_TASKS}; do /opt/check/run \"${category}\"; done\n        ;;\n    lint)\n        shellcheck -x -P SCRIPTDIR tests/container/run tests/container/check\n        markdownlint-cli2 \"$@\"\n        ;;\n    exec)\n        if [ \"$#\" -gt 0 ]; then exec \"$@\"; fi\n        exec sh -ec \"${COMMAND:?COMMAND is required}\"\n        ;;\n    *)\n        printf 'Unknown check category: %s\\n' \"${category}\" >&2\n        exit 2\n        ;;\nesac\n",
       "shell_inputs": [
         "tests/container/run",
-        "tests/container/check",
-        "tests/container/staged",
-        "tests/container/staged-git"
+        "tests/container/check"
       ]
     },
     "art-kit": {

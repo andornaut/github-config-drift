@@ -3110,3 +3110,13 @@ class TestNativeNodeProfiles:
         commands = ["shellcheck -x -P SCRIPTDIR tests/container/run tests/container/check", "npm run internal:lint"]
         with pytest.raises(ValueError, match="native test or build tool"):
             cd.node_container_steps(commands, files)
+
+    def test_game_dev_bridge_requires_native_shell_inputs_without_staged_helpers(self):
+        files = TestContainerFollowup.bridge_files("game-dev")
+        assert cd.container_steps({"lint"}, files) == {"action-shellcheck", "markdownlint-cli2-action"}
+        files["tests/container/check"] = files["tests/container/check"].replace(
+            "tests/container/run tests/container/check",
+            "tests/container/run tests/container/check tests/container/staged tests/container/staged-git",
+        )
+        with pytest.raises(ValueError, match="container"):
+            cd.container_steps({"lint"}, files)
