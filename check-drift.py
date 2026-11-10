@@ -1042,6 +1042,11 @@ def go_module_without_tools(text):
 
 def helper_profile(text):
     """Recognize fixed dispatch wrappers and inspect their selected lint body."""
+    profiles = json.loads((CANON / "container" / "check-profiles.json").read_text())["helpers"]
+    for name in ("node-check", "node-check-svelte"):
+        match = re.search(r"^check\)\n(.*?)^    ;;$", text, re.MULTILINE | re.DOTALL)
+        if match and text[: match.start(1)] + "    : CHECK_CHECK\n" + text[match.end(1) :] == profiles[name]["wrapper"]:
+            return name, [line.strip() for line in match[1].splitlines() if line.strip()]
     if "\nrun_task() {\n" not in text and 'command=$1\nshift\ncase "$command" in' not in text:
         return None, None
     profiles = json.loads((CANON / "container" / "check-profiles.json").read_text())["helpers"]
@@ -1061,87 +1066,153 @@ def helper_profile(text):
         if name.startswith("node"):
             for match in matches:
                 if match[1] != "lint" and any(
-                    not re.fullmatch(r'npm run internal:[a-z0-9:-]+(?: -- [a-zA-Z0-9_./=$@" -]+)?', line.strip())
+                    not re.fullmatch(
+                        r'npm run (?:internal:)?[a-z0-9:-]+(?: -- [a-zA-Z0-9_./=$@" -]+)?',
+                        line.strip(),
+                    )
                     for line in match[2].splitlines()
                     if line.strip()
                 ):
-                    raise ValueError("Node task bodies must dispatch directly to internal npm scripts")
+                    raise ValueError("Node task bodies must dispatch directly to native npm scripts")
         elif re.sub(r"https://github.com/andornaut/[A-Za-z0-9_-]+\.git", "REPOSITORY", lint) != profile["lint"]:
             continue
         return name, [line.strip() for line in lint.splitlines() if line.strip()]
     raise ValueError("container task helper differs from the inspected dispatch profiles")
 
 
-def node_container_steps(commands, files):
-    """Follow the Node wrapper through its frozen install and internal lint script."""
-    pin = yaml.safe_load((CANON / "shell" / "shellcheck-step.yml").read_text())[0]["with"]["version"]
-    docker = [line.strip() for line in files["tests/container/Dockerfile"].splitlines()]
-    docker = [line for line in docker if line and not line.startswith("#")]
-    expected = [
-        f"FROM koalaman/shellcheck:{pin} AS shellcheck",
-        "FROM node:${NODE_VERSION}",
-        "COPY --from=shellcheck /bin/shellcheck /usr/local/bin/shellcheck",
-        "ENV HUSKY=0",
-        "WORKDIR /opt/dependencies",
-        "COPY package.json package-lock.json ./",
-        "RUN npm ci --ignore-scripts --no-audit --no-fund",
-        "COPY tests/container/check /opt/check/run",
-    ]
-    if not docker or not re.fullmatch(r"ARG NODE_VERSION=[0-9.]+", docker[0]) or docker[1:] != expected:
-        raise ValueError("Node container must preserve its pinned tools, frozen install and task helper wiring")
-    context = set(files["tests/container/context"].splitlines())
-    if not {"tests/container/Dockerfile", "tests/container/check", "package.json", "package-lock.json"} <= context:
-        raise ValueError("Node container context omits its helper or package manifests")
-    shell = "shellcheck -x -P SCRIPTDIR tests/container/run tests/container/check"
-    staged = shell + " tests/container/staged tests/container/staged-git"
-    if commands not in (
-        [shell, "npm run internal:lint"],
-        [staged, "npm run internal:lint"],
-        [staged, "npm run internal:check:types", "npm run internal:lint"],
-    ):
-        raise ValueError("Node lint must run direct ShellCheck and internal:lint commands")
-    for path in commands[0].split()[4:]:
-        if not files.get(path):
-            raise ValueError(f"missing ShellCheck input {path}")
+def native_node_steps(commands, files):
+    """Inspect literal native npm scripts without following Make or container dispatch."""
     manifest = json.loads(files["package.json"])
     lock = json.loads(files["package-lock.json"])
     if not isinstance(manifest, dict) or not isinstance(lock, dict) or not isinstance(manifest.get("scripts"), dict):
-        raise TypeError("Node lint manifests must declare their internal scripts")
+        raise TypeError("Node lint manifests must declare their native scripts")
     scripts = manifest["scripts"]
-    if "npm run internal:check:types" in commands and (
-        scripts.get("internal:check:types") != "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json"
-        or any(name in scripts for name in ("preinternal:check:types", "postinternal:check:types"))
-    ):
-        raise ValueError("Node type checking must use its direct inspected script without lifecycle overrides")
-    script = scripts.get("internal:lint")
-    if not isinstance(script, str) or any(name in scripts for name in ("preinternal:lint", "postinternal:lint")):
-        raise ValueError("Node internal:lint must be a direct, unmasked script")
-    chain = script.split(" && ")
-    if any(
-        command not in {"prettier --check .", "eslint --max-warnings 0 .", "markdownlint-cli2"} for command in chain
-    ):
-        raise ValueError("Node internal:lint must contain direct, unmasked lint commands")
-    carried = {"action-shellcheck"}
-    if "markdownlint-cli2" in chain:
-        version = json.loads((CANON / "container" / "tools.json").read_text())["markdownlint-cli2"]
-        dependencies = manifest.get("devDependencies", {})
-        packages = lock.get("packages", {})
+    carried = set()
+
+    def script_steps(name, stack=()):
         if (
-            not isinstance(dependencies, dict)
-            or dependencies.get("markdownlint-cli2") not in {version, "^" + version, "~" + version}
-            or not isinstance(packages, dict)
-            or not isinstance(packages.get("node_modules/markdownlint-cli2"), dict)
-            or packages["node_modules/markdownlint-cli2"].get("version") != version
+            name in stack
+            or not isinstance(scripts.get(name), str)
+            or any(lifecycle in scripts for lifecycle in ("pre" + name, "post" + name))
         ):
-            raise ValueError(f"Node lint must install locked markdownlint-cli2 {version}")
-        carried.add("markdownlint-cli2-action")
+            raise ValueError(f"Node {name} must be a direct, unmasked script without lifecycle overrides")
+        text = scripts[name]
+        if name.removeprefix("internal:") in {"check", "check:types"} and text != (
+            "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json"
+        ):
+            raise ValueError("Node type checking must use its direct inspected script")
+        if not text or re.search(r"[|;`$<>\n\r]", text) or "&" in text.replace(" && ", ""):
+            raise ValueError(f"Node {name} must contain direct, unmasked native commands")
+        for command in text.split(" && "):
+            words = command.split()
+            if words[:2] == ["npm", "run"] and len(words) >= 3:
+                if words[3:] and (
+                    words[3] != "--" or any(not re.fullmatch(r"[-A-Za-z0-9_./=:]+", w) for w in words[4:])
+                ):
+                    raise ValueError("Node nested script arguments must be literal")
+                if words[2].removeprefix("internal:") in {"lint", "check", "check:types"} and words[3:]:
+                    raise ValueError("Node lint arguments must not override the inspected command")
+                script_steps(words[2], (*stack, name))
+            elif command == "markdownlint-cli2":
+                version = json.loads((CANON / "container" / "tools.json").read_text())["markdownlint-cli2"]
+                dependencies = manifest.get("devDependencies", {})
+                packages = lock.get("packages", {})
+                if (
+                    not isinstance(dependencies, dict)
+                    or dependencies.get("markdownlint-cli2") not in {version, "^" + version, "~" + version}
+                    or not isinstance(packages, dict)
+                    or not isinstance(packages.get("node_modules/markdownlint-cli2"), dict)
+                    or packages["node_modules/markdownlint-cli2"].get("version") != version
+                ):
+                    raise ValueError(f"Node lint must install locked markdownlint-cli2 {version}")
+                carried.add("markdownlint-cli2-action")
+            elif command.startswith("shellcheck -x -P SCRIPTDIR "):
+                shell_steps(words)
+            elif command in {"prettier --check .", "eslint --max-warnings 0 ."}:
+                pass
+            elif name.removeprefix("internal:") in {"lint", "check", "check:types"}:
+                if command not in {
+                    "svelte-kit sync",
+                    "svelte-check --tsconfig ./tsconfig.json",
+                }:
+                    raise ValueError(f"Node {name} must contain direct, unmasked lint commands")
+            elif command == "rm -rf web-ext-artifacts/*" and name == "package":
+                pass
+            elif (
+                not words
+                or words[0]
+                not in {
+                    "jest",
+                    "vitest",
+                    "vite",
+                    "esbuild",
+                    "tsc",
+                    "size-limit",
+                    "node",
+                    "web-ext",
+                }
+                or any(not re.fullmatch(r"[-A-Za-z0-9_./=:]+", word) for word in words)
+                or (
+                    words[0] == "node"
+                    and (len(words) < 2 or not re.fullmatch(r"[A-Za-z0-9_./-]+\.(?:mjs|cjs|js|ts)", words[1]))
+                )
+            ):
+                raise ValueError(f"Node {name} must invoke a native test or build tool")
+
+    def shell_steps(words):
+        if words[:4] != ["shellcheck", "-x", "-P", "SCRIPTDIR"] or len(words) < 5:
+            raise ValueError("Node ShellCheck must use direct, literal inputs")
+        for path in words[4:]:
+            if not re.fullmatch(r"[A-Za-z0-9_./-]+", path) or not files.get(path):
+                raise ValueError(f"missing ShellCheck input {path}")
+        carried.add("action-shellcheck")
+
+    for command in commands:
+        words = list(command)
+        if words[:2] == ["npm", "run"] and len(words) >= 3:
+            if words[3:] and (words[3] != "--" or any(not re.fullmatch(r"[-A-Za-z0-9_./=:]+", w) for w in words[4:])):
+                raise ValueError("Node task arguments must be literal")
+            if words[2].removeprefix("internal:") in {"lint", "check", "check:types"} and words[3:]:
+                raise ValueError("Node lint arguments must not override the inspected command")
+            script_steps(words[2])
+        elif words[:1] == ["shellcheck"]:
+            shell_steps(words)
+        else:
+            raise ValueError("Node tasks must invoke native npm scripts or direct ShellCheck")
     return carried
+
+
+def node_container_steps(commands, files):
+    """Follow a Node helper through its frozen install and direct native scripts."""
+    profiles = json.loads((CANON / "container" / "check-profiles.json").read_text())["dockerfiles"]
+    docker = docker_instructions(files["tests/container/Dockerfile"])
+    if docker != profiles["node"]:
+        raise ValueError("Node container must preserve its pinned tools, frozen install and task helper wiring")
+    context = set(files["tests/container/context"].splitlines())
+    if (
+        not {
+            "tests/container/Dockerfile",
+            "tests/container/check",
+            "package.json",
+            "package-lock.json",
+        }
+        <= context
+    ):
+        raise ValueError("Node container context omits its helper or package manifests")
+    shell = "shellcheck -x -P SCRIPTDIR tests/container/run tests/container/check"
+    if not commands or commands[0] != shell:
+        raise ValueError("Node lint must run direct ShellCheck and native npm commands")
+    return native_node_steps([tuple(command.split()) for command in commands], files)
 
 
 def docker_instructions(text):
     """Retain Docker parser directives and logical instructions for exact profiles."""
     return [
-        line.strip()
+        re.sub(
+            r"\bnpm ci --maxsockets=1 --ignore-scripts --no-audit --no-fund\b",
+            "npm ci --ignore-scripts --no-audit --no-fund",
+            line.strip(),
+        )
         for line in text.replace("\\\n", " ").splitlines()
         if line.strip() and (not line.lstrip().startswith("#") or re.match(r"#\s*(?:syntax|escape|check)=", line))
     ]

@@ -1707,7 +1707,7 @@ def profiled_files(profile, markdown=True):
     if family == "node":
         body = (
             "        shellcheck -x -P SCRIPTDIR tests/container/run tests/container/check "
-            "tests/container/staged tests/container/staged-git\n        npm run internal:lint\n"
+            "\n        npm run internal:lint\n"
         )
         helper = helper.replace("        : CHECK_LINT\n", body)
         helper = helper.replace("        : CHECK_TEST\n", "        npm run internal:test\n")
@@ -1716,7 +1716,10 @@ def profiled_files(profile, markdown=True):
         if markdown:
             script += " && markdownlint-cli2"
         files["package.json"] = json.dumps(
-            {"scripts": {"internal:lint": script}, "devDependencies": {"markdownlint-cli2": "0.24.0"}},
+            {
+                "scripts": {"internal:lint": script},
+                "devDependencies": {"markdownlint-cli2": "0.24.0"},
+            },
         )
         files["package-lock.json"] = json.dumps({"packages": {"node_modules/markdownlint-cli2": {"version": "0.24.0"}}})
         files["tests/container/context"] += "package.json\npackage-lock.json\n"
@@ -1755,7 +1758,7 @@ class TestContainerProfiles:
         manifest["scripts"]["internal:check:types"] = "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json"
         manifest["scripts"][field] = "true"
         files["package.json"] = json.dumps(manifest)
-        with pytest.raises(ValueError, match="Node type checking"):
+        with pytest.raises(ValueError, match=r"Node (?:internal:check:types|type checking)"):
             cd.container_steps({"lint"}, files)
 
     @pytest.mark.parametrize("profile", ["node", "node-svelte", "go", "rust"])
@@ -1796,23 +1799,24 @@ class TestContainerProfiles:
         with pytest.raises(ValueError, match="locked markdownlint"):
             cd.container_steps({"lint"}, files)
 
-    def test_node_fetches_root_manifests_and_referenced_staged_helpers(self, monkeypatch):
+    def test_node_fetches_root_manifests_and_native_shell_inputs(self, monkeypatch):
         files = profiled_files("node")
         patches, calls = repository(files)
         monkeypatch.setattr(cd, "fetch", patches["fetch"])
         assert cd.make_findings({"lint"}, "demo") == ([], {"action-shellcheck", "markdownlint-cli2-action"})
         assert "package.json" in calls
         assert "package-lock.json" in calls
-        assert "tests/container/staged-git" in calls
+        assert "tests/container/run" in calls
+        assert "tests/container/staged-git" not in calls
         assert "tests/container/package.json" not in calls
 
-    def test_node_missing_staged_shell_input_is_not_a_success(self, monkeypatch):
+    def test_node_missing_native_shell_input_is_not_a_success(self, monkeypatch):
         files = profiled_files("node")
-        del files["tests/container/staged-git"]
+        del files["tests/container/run"]
         patches, _ = repository(files)
         monkeypatch.setattr(cd, "fetch", patches["fetch"])
         found, carried = cd.make_findings({"lint"}, "demo")
-        assert found == [("Make checks", "missing tests/container/staged-git")]
+        assert found == [("Make checks", "missing tests/container/run")]
         assert carried == set()
 
     def test_docker_parser_directives_are_part_of_the_profile(self):
@@ -2968,3 +2972,119 @@ class TestMinimalCustomHarness:
         }
         found, _ = TestCheck.run(monkeypatch, files, workflows=("test.yml",), repo="faramir")
         assert found == []
+
+
+class TestNativeNodeProfiles:
+    @staticmethod
+    def files():
+        files = profiled_files("node")
+        manifest = json.loads(files["package.json"])
+        manifest["scripts"] = {
+            "lint": "prettier --check . && eslint --max-warnings 0 . && markdownlint-cli2",
+            "check:types": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+            "test": "jest",
+            "build": "npm run build:esm && npm run build:umd",
+            "build:esm": "esbuild src/index.js --bundle --format=esm --outfile=dist/index.js",
+            "build:umd": "esbuild src/index.js --bundle --format=iife --outfile=dist/index.umd.js",
+        }
+        files["package.json"] = json.dumps(manifest)
+        return files
+
+    def test_public_scripts_prove_locked_markdown_without_internal_aliases(self):
+        files = self.files()
+        assert cd.native_node_steps([("npm", "run", "lint")], files) == {"markdownlint-cli2-action"}
+        assert cd.native_node_steps([("npm", "run", "build"), ("npm", "run", "test")], files) == set()
+
+    @pytest.mark.parametrize("name", ["lint", "check:types", "test", "build"])
+    @pytest.mark.parametrize("change", ["make", "docker", "noop", "masked", "pre", "post"])
+    def test_native_scripts_cannot_delegate_skip_mask_or_override(self, name, change):
+        files = self.files()
+        manifest = json.loads(files["package.json"])
+        if change in {"pre", "post"}:
+            manifest["scripts"][change + name] = "true"
+        else:
+            manifest["scripts"][name] = {
+                "make": "make " + name,
+                "docker": "docker run node:24 npm run " + name,
+                "noop": "true",
+                "masked": manifest["scripts"][name] + " || true",
+            }[change]
+        files["package.json"] = json.dumps(manifest)
+        with pytest.raises(ValueError, match="Node"):
+            cd.native_node_steps([("npm", "run", name)], files)
+
+    @pytest.mark.parametrize("replacement", ["0.23.2", "^0.24.0"])
+    def test_native_markdown_requires_an_exact_installed_version(self, replacement):
+        files = self.files()
+        files["package-lock.json"] = files["package-lock.json"].replace("0.24.0", replacement)
+        with pytest.raises(ValueError, match="locked markdownlint"):
+            cd.native_node_steps([("npm", "run", "lint")], files)
+
+    @pytest.mark.parametrize("profile", ["node-check", "node-check-svelte"])
+    def test_single_check_helper_proves_public_native_commands(self, profile):
+        files = self.files()
+        body = (
+            "    shellcheck -x -P SCRIPTDIR tests/container/run tests/container/check\n"
+            "    npm run check:types\n    npm run lint\n    npm run test -- --runInBand\n    npm run build\n"
+        )
+        helper = HELPER_PROFILES[profile]["wrapper"].replace("    : CHECK_CHECK\n", body)
+        found, commands = cd.helper_profile(helper)
+        assert found == profile
+        assert cd.node_container_steps(commands, files) == {
+            "action-shellcheck",
+            "markdownlint-cli2-action",
+        }
+        with pytest.raises(ValueError, match="dispatch profiles"):
+            cd.helper_profile(helper.replace("set -eu", "set -eu\nexit 0"))
+
+    def test_literal_socket_one_preserves_the_frozen_install_profile(self):
+        files = self.files()
+        files["tests/container/Dockerfile"] = files["tests/container/Dockerfile"].replace(
+            "npm ci --ignore-scripts",
+            "npm ci --maxsockets=1 --ignore-scripts",
+        )
+        commands = [
+            "shellcheck -x -P SCRIPTDIR tests/container/run tests/container/check",
+            "npm run lint",
+        ]
+        assert cd.node_container_steps(commands, files) == {
+            "action-shellcheck",
+            "markdownlint-cli2-action",
+        }
+
+    @pytest.mark.parametrize(
+        "install",
+        [
+            "npm ci --maxsockets=2 --ignore-scripts --no-audit --no-fund",
+            "npm ci --maxsockets=$LIMIT --ignore-scripts --no-audit --no-fund",
+            "npm ci --maxsockets=1 --maxsockets=1 --ignore-scripts --no-audit --no-fund",
+            "npm ci --maxsockets=1 --no-audit --no-fund",
+            "npm ci --maxsockets=1 --ignore-scripts --no-audit --no-fund || true",
+        ],
+    )
+    def test_socket_spelling_cannot_change_or_mask_the_inspected_install(self, install):
+        files = self.files()
+        files["tests/container/Dockerfile"] = files["tests/container/Dockerfile"].replace(
+            "npm ci --ignore-scripts --no-audit --no-fund",
+            install,
+        )
+        with pytest.raises(ValueError, match="Node container"):
+            cd.node_container_steps(
+                [
+                    "shellcheck -x -P SCRIPTDIR tests/container/run tests/container/check",
+                    "npm run lint",
+                ],
+                files,
+            )
+
+    def test_lint_arguments_cannot_turn_the_tool_into_a_version_probe(self):
+        with pytest.raises(ValueError, match="arguments"):
+            cd.native_node_steps([("npm", "run", "lint", "--", "--version")], self.files())
+
+    def test_type_checking_requires_the_checker_after_svelte_sync(self):
+        files = self.files()
+        manifest = json.loads(files["package.json"])
+        manifest["scripts"]["check:types"] = "svelte-kit sync"
+        files["package.json"] = json.dumps(manifest)
+        with pytest.raises(ValueError, match="type checking"):
+            cd.native_node_steps([("npm", "run", "check:types")], files)
