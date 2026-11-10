@@ -99,12 +99,8 @@ prettier entry to be `*` with `--ignore-unknown`. Only that entry is compared. T
 hook and CI have to cover one set of files: a hand-written list of types is how the
 hook came to check less than `prettier --check .` does, missing the
 `.markdownlint-cli2.yaml` every repository carries. The same repository is expected
-to carry `.husky/pre-commit`: the direct form is one line,
-`npx lint-staged --concurrent false`. The reviewed container wrapper preserves the
-same prettier arguments and serial orchestration. It is accepted only after both
-wrapper files match their approved executable Git modes, immutable blob IDs and
-source digests, and their Make, dispatcher, Dockerfile and frozen tool manifests
-prove the complete container path. It runs the entries serially because the prettier and eslint
+to carry `.husky/pre-commit`: one line, `npx lint-staged --concurrent false`.
+It runs the entries serially because the prettier and eslint
 entries match the same scripts, and two tasks rewriting one file at once lose one
 of the fixes.
 

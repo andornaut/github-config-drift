@@ -7,10 +7,11 @@ rollout. This grants no game runtime or delivery control.
 
 ## Command direction
 
-Native ecosystem commands, including npm, Cargo and Go commands, run directly on
-the host when invoked there. They must not delegate to Make, Docker or a container
-launcher. Make is an external automation interface that invokes those same native
-commands in isolated containers. The dependency direction is one-way.
+Ordinary native verification entrypoints, including npm, Cargo and Go checks, run
+directly on the host when invoked there. They must not delegate to Make, Docker or
+a container launcher. Make invokes those native commands in isolated containers;
+the dependency direction is one-way. Packaging, provenance and multicontainer host
+controllers retain the explicit exceptions below.
 
 `make check` is the only required Make target. It provides the repository's full,
 deterministic verification gate for AI Maintainer and other automation, failing if
@@ -66,8 +67,8 @@ admission catalog. Preserve existing game quiet windows, load guards and deliver
 ownership. Do not add clock or load gates to other repositories as part of this
 contract.
 
-Explicit multicontainer and provenance workflows retain their reviewed host
-controllers. Controllers orchestrate isolated jobs and preserve source/image
+Explicit packaging, multicontainer and provenance workflows retain their reviewed
+host controllers. Controllers orchestrate isolated jobs and preserve source/image
 identity; they do not move test execution onto the host. Existing macOS-only checks
 retain their native sandbox route. These are bounded implementation exceptions,
 not permission to bypass isolation or required checks.
