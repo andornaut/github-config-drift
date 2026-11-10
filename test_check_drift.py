@@ -1650,3 +1650,213 @@ class TestContainerAdmissionProfile:
     def test_a_path_alone_does_not_prove_a_host_admission_hook_is_resource_only(self):
         with pytest.raises(ValueError, match="inspected resource-only"):
             cd.make_tasks(MAKE_INTERFACE + "CHECK_ADMISSION := scripts/run-tests.sh\nexport CHECK_ADMISSION\n")
+
+
+class TestAdaResourceAdmission:
+    @staticmethod
+    def inputs():
+        reference = json.loads((cd.CANON / "container" / "admissions.json").read_text())["ada-the-navigator"]
+        tree = {
+            "truncated": False,
+            "tree": [
+                {"path": path, "type": "blob", "mode": entry["mode"], "sha": entry["blob"]}
+                for path, entry in reference["files"].items()
+            ],
+        }
+        responses = [StubResult(stdout=json.dumps(tree))]
+        responses.extend(
+            StubResult(
+                stdout=json.dumps(
+                    {
+                        "sha": entry["blob"],
+                        "encoding": "base64",
+                        "content": base64.b64encode(entry["content"].encode()).decode(),
+                    }
+                )
+            )
+            for entry in reference["files"].values()
+        )
+        text = MAKE_INTERFACE + "CHECK_ADMISSION := tests/container/admit\nexport CHECK_ADMISSION\n"
+        return reference, tree, responses, text
+
+    def test_ada_fetches_only_both_approved_immutable_blobs_after_metadata_proof(self, monkeypatch):
+        reference, _, responses, text = self.inputs()
+        files = container_files()
+        files["Makefile"] = text
+        patches, fetches = repository(files)
+        monkeypatch.setattr(cd, "fetch", patches["fetch"])
+        run = run_returning(*responses)
+        monkeypatch.setattr(cd.subprocess, "run", run)
+        assert cd.make_findings({"lint"}, "ada-the-navigator") == ([], {"markdownlint-cli2-action"})
+        assert [args[2] for args in run.calls] == [
+            "repos/andornaut/ada-the-navigator/git/trees/HEAD?recursive=1",
+            *(f"repos/andornaut/ada-the-navigator/git/blobs/{entry['blob']}" for entry in reference["files"].values()),
+        ]
+        assert "tests/container/admit" not in fetches
+        assert "tests/container/admit.mjs" not in fetches
+
+    @pytest.mark.parametrize("declaration", ["", "CHECK_ADMISSION :=\nexport CHECK_ADMISSION\n"])
+    def test_empty_admission_has_no_additional_api_calls(self, monkeypatch, declaration):
+        def unexpected(*args, **kwargs):
+            raise AssertionError("empty admission must not query Git metadata or blobs")
+
+        monkeypatch.setattr(cd.subprocess, "run", unexpected)
+        text = MAKE_INTERFACE + declaration
+        assert cd.admission_makefile("demo", text) == text
+
+    @pytest.mark.parametrize(
+        ("repo", "path"),
+        [
+            ("github-config-drift", "tests/container/admit"),
+            ("other-game", "tests/container/admit"),
+            ("ada-the-navigator", "scripts/run-tests.sh"),
+        ],
+    )
+    def test_unknown_repo_or_hook_is_rejected_without_fetching_its_bytes(self, monkeypatch, repo, path):
+        def unexpected(*args, **kwargs):
+            raise AssertionError("unapproved admission must not reach the API")
+
+        monkeypatch.setattr(cd.subprocess, "run", unexpected)
+        with pytest.raises(ValueError, match="repository-scoped"):
+            cd.admission_makefile(repo, MAKE_INTERFACE + f"CHECK_ADMISSION := {path}\n")
+
+    @pytest.mark.parametrize(
+        ("index", "field", "value"),
+        [
+            (0, "mode", "120000"),
+            (1, "mode", "120000"),
+            (0, "mode", "100644"),
+            (1, "mode", "100755"),
+            (0, "type", "tree"),
+            (1, "type", "tree"),
+            (0, "sha", "0" * 40),
+            (1, "sha", "0" * 40),
+        ],
+    )
+    def test_both_entries_require_the_approved_regular_file_modes_and_blob_ids(self, monkeypatch, index, field, value):
+        _, tree, _, text = self.inputs()
+        tree["tree"][index][field] = value
+        run = run_returning(StubResult(stdout=json.dumps(tree)))
+        monkeypatch.setattr(cd.subprocess, "run", run)
+        with pytest.raises(ValueError, match="metadata differs"):
+            cd.admission_makefile("ada-the-navigator", text)
+        assert len(run.calls) == 1
+
+    @pytest.mark.parametrize("index", [0, 1])
+    def test_missing_either_helper_prevents_every_content_fetch(self, monkeypatch, index):
+        _, tree, _, text = self.inputs()
+        tree["tree"].pop(index)
+        run = run_returning(StubResult(stdout=json.dumps(tree)))
+        monkeypatch.setattr(cd.subprocess, "run", run)
+        with pytest.raises(ValueError, match="missing approved"):
+            cd.admission_makefile("ada-the-navigator", text)
+        assert len(run.calls) == 1
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "not json",
+            "[]",
+            '{"truncated":true,"tree":[]}',
+            '{"tree":[]}',
+            '{"truncated":false,"tree":{}}',
+            '{"truncated":false,"tree":[null]}',
+        ],
+    )
+    def test_malformed_or_truncated_tree_is_unknown_instead_of_clean(self, monkeypatch, body):
+        _, _, _, text = self.inputs()
+        run = run_returning(StubResult(stdout=body))
+        monkeypatch.setattr(cd.subprocess, "run", run)
+        with pytest.raises(cd.GhError, match="resource admission"):
+            cd.admission_makefile("ada-the-navigator", text)
+        assert len(run.calls) == 1
+
+    def test_duplicate_tree_paths_cannot_choose_an_approved_entry_over_a_symlink(self, monkeypatch):
+        _, tree, _, text = self.inputs()
+        tree["tree"].append(dict(tree["tree"][0], mode="120000"))
+        run = run_returning(StubResult(stdout=json.dumps(tree)))
+        monkeypatch.setattr(cd.subprocess, "run", run)
+        with pytest.raises(cd.GhError, match="duplicate"):
+            cd.admission_makefile("ada-the-navigator", text)
+        assert len(run.calls) == 1
+
+    @pytest.mark.parametrize("index", [1, 2])
+    def test_both_approved_blob_endpoints_still_require_the_approved_byte_hashes(self, monkeypatch, index):
+        _, _, responses, text = self.inputs()
+        blob = json.loads(responses[index].stdout)
+        blob["content"] = base64.b64encode(b"unapproved replacement").decode()
+        responses[index] = StubResult(stdout=json.dumps(blob))
+        monkeypatch.setattr(cd.subprocess, "run", run_returning(*responses))
+        with pytest.raises(ValueError, match="bytes differ"):
+            cd.admission_makefile("ada-the-navigator", text)
+
+    @pytest.mark.parametrize(
+        ("field", "value"), [("sha", "0" * 40), ("encoding", "utf-8"), ("content", "!!!"), ("content", None)]
+    )
+    def test_malformed_blob_metadata_or_encoding_cannot_be_accepted(self, monkeypatch, field, value):
+        _, _, responses, text = self.inputs()
+        blob = json.loads(responses[1].stdout)
+        blob[field] = value
+        responses[1] = StubResult(stdout=json.dumps(blob))
+        monkeypatch.setattr(cd.subprocess, "run", run_returning(*responses))
+        with pytest.raises(cd.GhError, match="resource admission blob"):
+            cd.admission_makefile("ada-the-navigator", text)
+
+    def test_api_failure_remains_a_sweep_failure(self, monkeypatch):
+        _, _, _, text = self.inputs()
+        monkeypatch.setattr(cd.subprocess, "run", run_returning(StubResult(1, "", "HTTP 403")))
+        monkeypatch.setattr(cd.time, "sleep", lambda _: None)
+        with pytest.raises(cd.GhError, match="HTTP 403"):
+            cd.admission_makefile("ada-the-navigator", text)
+
+    def test_missing_local_approval_reference_is_a_finding(self, monkeypatch, tmp_path):
+        _, _, _, text = self.inputs()
+        monkeypatch.setattr(cd, "CANON", tmp_path)
+        with pytest.raises(ValueError, match="reference is missing"):
+            cd.admission_makefile("ada-the-navigator", text)
+
+    def test_duplicate_declarations_cannot_hide_the_effective_admission_value(self):
+        _, _, _, text = self.inputs()
+        with pytest.raises(ValueError, match="unambiguous"):
+            cd.admission_makefile("ada-the-navigator", text + "CHECK_ADMISSION ?=\n")
+
+    @pytest.mark.parametrize(
+        "suffix",
+        [
+            "CHECK_ADMISSION := scripts/run-tests.sh\n",
+            "CHECK_ADMISSION ?=\n",
+            "CHECK_ADMISSION += scripts/run-tests.sh\n",
+            "export CHECK_ADMISSION := scripts/run-tests.sh\n",
+            "lint: CHECK_ADMISSION=scripts/run-tests.sh\n",
+            "UNRELATED := $(eval CHECK_ADMISSION:=scripts/run-tests.sh)\n",
+        ],
+    )
+    def test_later_overrides_or_macros_cannot_be_normalized_into_approval(self, monkeypatch, suffix):
+        _, _, responses, text = self.inputs()
+        files = container_files()
+        files["Makefile"] = text + suffix
+        patches, _ = repository(files)
+        monkeypatch.setattr(cd, "fetch", patches["fetch"])
+        monkeypatch.setattr(cd.subprocess, "run", run_returning(*responses))
+        found, carried = cd.make_findings({"lint"}, "ada-the-navigator")
+        assert len(found) == 1
+        assert carried == set()
+        assert files["Makefile"] == text + suffix
+
+    @pytest.mark.parametrize(
+        "declaration",
+        [
+            "CHECK_ADMISSION ?= tests/container/admit",
+            "CHECK_ADMISSION = tests/container/admit",
+            'CHECK_ADMISSION := "tests/container/admit"',
+            "CHECK_ADMISSION := tests/container/../container/admit",
+            "CHECK_ADMISSION := $(ADMISSION)",
+        ],
+    )
+    def test_only_the_single_exact_immediate_literal_path_can_request_proof(self, monkeypatch, declaration):
+        def unexpected(*args, **kwargs):
+            raise AssertionError("unsupported declaration must not reach the API")
+
+        monkeypatch.setattr(cd.subprocess, "run", unexpected)
+        with pytest.raises(ValueError, match=r".+"):
+            cd.admission_makefile("ada-the-navigator", MAKE_INTERFACE + declaration + "\n")

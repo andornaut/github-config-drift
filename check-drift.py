@@ -20,6 +20,7 @@ import argparse
 import base64
 import binascii
 import difflib
+import hashlib
 import json
 import re
 import subprocess
@@ -967,6 +968,79 @@ def container_steps(targets, files):
     return carried
 
 
+def admission_makefile(repo, text):
+    """Prove the repository-scoped resource hook before following immutable blobs."""
+    declarations = list(
+        re.finditer(r"^CHECK_ADMISSION[ \t]*(?P<operator>:=|\?=|=)[ \t]*(?P<path>[^\n]*)$", text, re.MULTILINE)
+    )
+    selected = [match for match in declarations if match["path"].strip()]
+    if not selected:
+        return text
+    if len(declarations) != 1 or selected[0]["operator"] != ":=":
+        raise ValueError("CHECK_ADMISSION must have one unambiguous immediate literal declaration")
+    reference_path = CANON / "container" / "admissions.json"
+    if not reference_path.is_file():
+        raise ValueError("resource admission reference is missing")
+    references = json.loads(reference_path.read_text())
+    reference = references.get(repo) if isinstance(references, dict) else None
+    if not isinstance(reference, dict) or selected[0]["path"].strip() != reference.get("path"):
+        raise ValueError("nonempty CHECK_ADMISSION needs an approved repository-scoped resource-only profile")
+    approved = reference.get("files")
+    if not isinstance(approved, dict) or set(approved) != {"tests/container/admit", "tests/container/admit.mjs"}:
+        raise ValueError("resource admission reference must name both fixed helper files")
+    for expected in approved.values():
+        if not isinstance(expected, dict) or any(key not in expected for key in ("mode", "blob", "sha256", "content")):
+            raise ValueError("resource admission reference is incomplete")
+        if hashlib.sha256(expected["content"].encode()).hexdigest() != expected["sha256"]:
+            raise ValueError("resource admission reference bytes do not match their digest")
+
+    def api(endpoint):
+        try:
+            response = json.loads(gh("api", endpoint))
+        except (json.JSONDecodeError, TypeError) as error:
+            raise GhError("resource admission API did not return a JSON object") from error
+        if not isinstance(response, dict):
+            raise GhError("resource admission API did not return a JSON object")
+        return response
+
+    tree = api(f"repos/andornaut/{repo}/git/trees/HEAD?recursive=1")
+    if tree.get("truncated") is not False or not isinstance(tree.get("tree"), list):
+        raise GhError("resource admission requires a complete nontruncated Git tree")
+    entries = {}
+    for entry in tree["tree"]:
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+            raise GhError("resource admission Git tree contains malformed entries")
+        path = entry["path"]
+        if path not in approved:
+            continue
+        if path in entries:
+            raise GhError("resource admission Git tree contains duplicate helper paths")
+        entries[path] = entry
+    for path, expected in approved.items():
+        entry = entries.get(path)
+        if entry is None:
+            raise ValueError(f"missing approved resource admission helper {path}")
+        if entry.get("type") != "blob" or entry.get("mode") != expected["mode"] or entry.get("sha") != expected["blob"]:
+            raise ValueError(f"resource admission helper metadata differs for {path}")
+    for path, expected in approved.items():
+        blob = api(f"repos/andornaut/{repo}/git/blobs/{expected['blob']}")
+        if (
+            blob.get("sha") != expected["blob"]
+            or blob.get("encoding") != "base64"
+            or not isinstance(blob.get("content"), str)
+        ):
+            raise GhError("resource admission blob response has invalid metadata")
+        try:
+            content = base64.b64decode("".join(blob["content"].split()), validate=True)
+        except binascii.Error as error:
+            raise GhError("resource admission blob response has invalid base64") from error
+        if hashlib.sha256(content).hexdigest() != expected["sha256"]:
+            raise ValueError(f"resource admission helper bytes differ for {path}")
+    # The exact approved hook only admits resources; it cannot replace a lint command.
+    match = selected[0]
+    return text[: match.start()] + "CHECK_ADMISSION :=" + text[match.end() :]
+
+
 def make_findings(targets, repo):
     """Fetch a Make contract only after CI selects its literal check categories."""
     paths = (
@@ -1013,7 +1087,8 @@ def make_findings(targets, repo):
                 return [("Make checks", f"missing {path}")], set()
             files[path] = decode(content)
     try:
-        return [], container_steps(targets, files)
+        checked_files = {**files, "Makefile": admission_makefile(repo, files["Makefile"])}
+        return [], container_steps(targets, checked_files)
     except (ValueError, TypeError, KeyError) as error:
         return [("Make checks", str(error))], set()
 
