@@ -809,6 +809,39 @@ def make_job_environment(environment):
     )
 
 
+def harness_workflow_targets(repo, text):
+    """Recognize only the reviewed custom host controller's literal lint route."""
+    if repo != "faramir":
+        return set(), []
+    try:
+        document = workflow_document(text)
+    except (ValueError, yaml.YAMLError) as error:
+        return set(), [f"invalid custom host controller workflow: {error}"]
+    targets, complaints = set(), []
+    for job in (document.get("jobs") or {}).values():
+        if not isinstance(job, dict):
+            continue
+        for step in job.get("steps") or []:
+            if not isinstance(step, dict):
+                continue
+            command = step.get("run", "")
+            if not isinstance(command, str) or not re.search(r"(?:\./)?tests/container/run\s+lint\b", command):
+                continue
+            if (
+                re.fullmatch(r"(?:\./)?tests/container/run lint", command.strip()) is None
+                or any(owner.get("continue-on-error") or owner.get("env") for owner in (document, job, step))
+                or any(owner.get("if") not in (None, "success()") for owner in (job, step))
+                or any(owner.get("defaults") for owner in (document, job))
+                or step.get("working-directory")
+                or step.get("shell") not in (None, "bash", "sh")
+                or job.get("container")
+            ):
+                complaints.append("custom lint coverage requires its unmasked literal host controller")
+            else:
+                targets.add("native-lint")
+    return targets, complaints
+
+
 def make_workflow_targets(text):
     """Literal Make categories that an unmasked workflow step actually runs."""
     document = yaml.safe_load(text)
@@ -1442,14 +1475,14 @@ def harness_steps(targets, repo):
         raise ValueError("custom lint harness needs a literal numeric Node version")
     makefile = files["Makefile"].decode()
     normalized = makefile.replace("\t@tests/container/run lint\n", "\t@./tests/container/run $@\n")
-    tasks, recipes = make_tasks(normalized)
-    if "lint" in targets and "lint" not in tasks:
-        raise ValueError("selected make lint is absent from CHECK_TASKS")
+    # The reviewed runner owns a fixed lint/test/build loop, independent of Make variables.
+    context = "CHECK_TASKS := lint test build\nexport CHECK_TASKS\n"
+    _, recipes = make_tasks(context + normalized)
     if "lint" in targets and recipes.get("lint") != ["@./tests/container/run $@"]:
         raise ValueError("selected make lint needs its direct dispatch alias")
-    if "lint" not in tasks or not targets.intersection({"lint", "check"}):
+    if not targets.intersection({"lint", "check", "native-lint"}):
         return set()
-    if "lint" not in targets and recipes.get("check") != ["@tests/container/run check"]:
+    if recipes.get("check") != ["@tests/container/run check"]:
         raise ValueError("custom make check does not dispatch directly to the reviewed lint harness")
     docker = files["tests/container/Dockerfile"].decode()
     shell_pin = yaml.safe_load((CANON / "shell" / "shellcheck-step.yml").read_text())[0]["with"]["version"]
@@ -1746,6 +1779,9 @@ def check(repo, uses=None):
         found += rows
         stepped |= carried
         targets, complaints = make_workflow_targets(text)
+        make_targets |= targets
+        found += [(f"Make checks ({name})", complaint) for complaint in complaints]
+        targets, complaints = harness_workflow_targets(repo, text)
         make_targets |= targets
         found += [(f"Make checks ({name})", complaint) for complaint in complaints]
         if uses is not None:

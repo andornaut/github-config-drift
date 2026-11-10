@@ -2250,8 +2250,7 @@ class TestPlainContainerShellInputs:
 
 
 FARAMIR_MAKE = """.DEFAULT_GOAL := check
-CHECK_TASKS := lint test build
-export CHECK_TASKS COMMAND
+export COMMAND
 .PHONY: check lint test build
 check:
 \t@tests/container/run check
@@ -2383,13 +2382,13 @@ class TestFrozenHarness:
         ("before", "after"),
         [
             ("@tests/container/run lint", "@tests/container/run lint || true"),
-            ("CHECK_TASKS := lint test build", "CHECK_TASKS := $(shell echo lint)"),
-            ("CHECK_TASKS := lint test build", "CHECK_TASKS := test"),
+            (".DEFAULT_GOAL := check", "CHECK_TASKS := $(shell echo lint)"),
+            (".DEFAULT_GOAL := check", "CHECK_TASKS := test"),
             (".DEFAULT_GOAL := check", "SHELL := true"),
             (".DEFAULT_GOAL := check", ".IGNORE:"),
         ],
     )
-    def test_make_dispatch_and_declared_categories_cannot_be_masked_or_overridden(self, monkeypatch, before, after):
+    def test_make_dispatch_and_fixed_categories_cannot_be_masked_or_overridden(self, monkeypatch, before, after):
         text = FARAMIR_MAKE.replace(before, after)
         tree, blobs = self.inputs(makefile=text)
         self.install(monkeypatch, tree, blobs)
@@ -2406,14 +2405,12 @@ class TestFrozenHarness:
         assert "does not dispatch directly" in found[0][1]
         assert carried == set()
 
-    def test_a_check_without_declared_lint_carries_no_lint_coverage(self, monkeypatch):
-        tree, blobs = self.inputs(
-            makefile=FARAMIR_MAKE.replace("CHECK_TASKS := lint test build", "CHECK_TASKS := test")
-            .replace("lint:\n\t@tests/container/run lint\n", "")
-            .replace("build:\n\t@tests/container/run build\n", "")
-        )
+    def test_task_metadata_cannot_change_the_reviewed_fixed_check_loop(self, monkeypatch):
+        tree, blobs = self.inputs(makefile=FARAMIR_MAKE + "CHECK_TASKS := test\n")
         self.install(monkeypatch, tree, blobs)
-        assert cd.make_findings({"check"}, "faramir") == ([], set())
+        found, carried = cd.make_findings({"check"}, "faramir")
+        assert len(found) == 1
+        assert carried == set()
 
     def test_truncation_is_unknown_instead_of_missing_context_or_clean(self, monkeypatch):
         tree, blobs = self.inputs()
@@ -2906,3 +2903,68 @@ class TestMakeCheckContract:
         files["Makefile"] = self.check_only().replace("@./tests/container/run $@", dispatch)
         with pytest.raises(ValueError, match="custom make check"):
             cd.container_steps({"check"}, files)
+
+
+class TestMinimalCustomHarness:
+    def test_native_lint_needs_only_the_required_make_check_target(self, monkeypatch):
+        text = FARAMIR_MAKE.replace("lint:\n\t@tests/container/run lint\n", "")
+        tree, blobs = TestFrozenHarness.inputs(makefile=text)
+        TestFrozenHarness.install(monkeypatch, tree, blobs)
+        assert cd.make_findings({"native-lint"}, "faramir") == ([], {"action-shellcheck", "markdownlint-cli2-action"})
+
+    def test_an_explicit_make_lint_still_requires_its_optional_alias(self, monkeypatch):
+        text = FARAMIR_MAKE.replace("lint:\n\t@tests/container/run lint\n", "")
+        tree, blobs = TestFrozenHarness.inputs(makefile=text)
+        TestFrozenHarness.install(monkeypatch, tree, blobs)
+        found, carried = cd.make_findings({"lint"}, "faramir")
+        assert len(found) == 1
+        assert "direct dispatch alias" in found[0][1]
+        assert carried == set()
+
+    @pytest.mark.parametrize("recipe", ["@true", "@tests/container/run check || true"])
+    def test_native_lint_does_not_waive_the_mandatory_make_check_route(self, monkeypatch, recipe):
+        text = FARAMIR_MAKE.replace("@tests/container/run check", recipe)
+        tree, blobs = TestFrozenHarness.inputs(makefile=text)
+        TestFrozenHarness.install(monkeypatch, tree, blobs)
+        found, carried = cd.make_findings({"native-lint"}, "faramir")
+        assert len(found) == 1
+        assert carried == set()
+
+    @pytest.mark.parametrize("prefix", ["", "./"])
+    def test_only_the_reviewed_host_lint_controller_is_selected(self, prefix):
+        text = TestWorkflowFindings.with_steps(f"      - run: {prefix}tests/container/run lint")
+        assert cd.harness_workflow_targets("faramir", text) == ({"native-lint"}, [])
+        assert cd.harness_workflow_targets("demo", text) == (set(), [])
+
+    @pytest.mark.parametrize(
+        "step",
+        [
+            "run: tests/container/run lint || true",
+            "run: tests/container/run lint\n        continue-on-error: true",
+            "run: tests/container/run lint\n        env: {COMMAND: true}",
+            "run: tests/container/run lint\n        if: false",
+            "run: tests/container/run lint\n        working-directory: elsewhere",
+            "run: tests/container/run lint\n        shell: python",
+        ],
+    )
+    def test_custom_controller_masks_and_overrides_do_not_receive_coverage(self, step):
+        text = TestWorkflowFindings.with_steps("      - " + step)
+        targets, found = cd.harness_workflow_targets("faramir", text)
+        assert targets == set()
+        assert len(found) == 1
+
+    def test_malformed_custom_workflows_remain_findings(self):
+        targets, found = cd.harness_workflow_targets("faramir", "jobs: {lint: {}, lint: {}}")
+        assert targets == set()
+        assert len(found) == 1
+
+    def test_estate_check_follows_the_reviewed_host_lint_route(self, monkeypatch):
+        tree, blobs = TestFrozenHarness.inputs()
+        TestFrozenHarness.install(monkeypatch, tree, blobs)
+        files = {
+            ".markdownlint-cli2.yaml": (cd.CANON / "markdown" / "markdownlint-cli2.yaml").read_text(),
+            ".github/workflows/ai-attributions.yml": (cd.CANON / "attributions" / "ai-attributions.yml").read_text(),
+            ".github/workflows/test.yml": TestWorkflowFindings.with_steps("      - run: tests/container/run lint"),
+        }
+        found, _ = TestCheck.run(monkeypatch, files, workflows=("test.yml",), repo="faramir")
+        assert found == []
