@@ -133,8 +133,8 @@ workflow runs it on Mondays at 07:00 UTC, and on a push to `main` touching
 
 ## Developing
 
-Make and Docker run the project-owned checks. The container uses the declared
-Python runtime and pinned tooling; only a source snapshot and scratch storage
+Checks require Make and Docker 29.9.3, matching CI. The container uses the
+declared Python runtime and pinned tooling; only a source snapshot and scratch storage
 are mounted.
 
 ```bash

@@ -43,23 +43,15 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
         with:
-          # Nothing in this job uses the token, so it is not left
-          # in .git/config for a later step to read.
           persist-credentials: false
 
-      - name: Set up Python
-        uses: actions/setup-python@v7.1.0
+      - name: Set up Docker
+        uses: docker/setup-docker-action@v5.7.0
         with:
-          python-version-file: .python-version
+          version: v29.9.3
 
-      # Pinned in a manifest rather than installed by name, so Dependabot can
-      # see the version and a pytest release cannot turn this red on a commit
-      # that did not touch the tests.
-      - name: Install dependencies
-        run: pip install -r requirements-dev.txt
-
-      - name: Run tests
-        run: python -m pytest -v
+      - name: Run test
+        run: make test
 
   lint:
     name: Lint
@@ -70,38 +62,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
         with:
-          # Nothing in this job uses the token, so it is not left
-          # in .git/config for a later step to read.
           persist-credentials: false
 
-      - name: Set up Python
-        uses: actions/setup-python@v7.1.0
+      - name: Set up Docker
+        uses: docker/setup-docker-action@v5.7.0
         with:
-          python-version-file: .python-version
+          version: v29.9.3
 
-      # Pinned in a manifest rather than installed by name, so Dependabot can
-      # see the version and a ruff release cannot turn this red on a commit
-      # that did not touch the sources.
-      - name: Install dependencies
-        run: pip install -r requirements-dev.txt
-
-      # Both sources carry a .py extension, so a bare `.` finds them and
-      # ruff.toml needs no `extend-include`. Settings live in that file rather
-      # than on the command line, so a local run covers what this one does.
-      - name: Run ruff check
-        run: ruff check .
-
-      - name: Run ruff format check
-        run: ruff format --check .
-
-      # The action bundles markdownlint-cli2, so its own tag is the tool pin and
-      # Dependabot proposes the bump through the github-actions ecosystem. It
-      # fetches nothing at run time, so a slow host cannot turn this red.
-      - name: Run markdownlint
-        uses: DavidAnson/markdownlint-cli2-action@v25.0.0
-        with:
-          # Empty on purpose. The action defaults this to `*.{md,markdown}`,
-          # which is the repository root only, and anything passed here outranks
-          # the `globs` in .markdownlint-cli2.yaml. Empty leaves the config file
-          # deciding, so this gate and a local `markdownlint-cli2` read one list.
-          globs: ""
+      - name: Run lint
+        run: make lint
