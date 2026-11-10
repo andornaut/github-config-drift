@@ -976,3 +976,514 @@ class TestCheck:
         found, calls = self.run(monkeypatch, {}, workflows=("gone.yml",))
         assert ".github/workflows/gone.yml" in calls
         assert not any("gone.yml" in label for label, _ in found)
+
+
+MAKE_INTERFACE = """.DEFAULT_GOAL := check
+CHECK_TASKS := lint test build
+CONTAINER_BUILD_ARGS := PYTHON_VERSION=$(shell cat .python-version)
+export CHECK_TASKS CONTAINER_BUILD_ARGS
+.PHONY: check check-info lint test build exec
+check lint test build exec:
+\t@./tests/container/run $@
+check-info:
+\t@./tests/container/run info
+"""
+
+CONTAINER_HELPER = """#!/bin/sh
+set -eu
+
+category=${1:-check}
+if [ "$#" -gt 0 ]; then shift; fi
+case "${category}" in
+    lint)
+        ruff check .
+        ruff format --check .
+        markdownlint-cli2
+        ;;
+    *)
+        exit 2
+        ;;
+esac
+"""
+
+DOCKER_PROFILES = json.loads((cd.CANON / "container" / "check-profiles.json").read_text())["dockerfiles"]
+CONTAINER_DOCKER = "\n".join(DOCKER_PROFILES["python-direct"]) + "\n"
+
+
+def container_files():
+    """A literal Make interface with the canonical dispatcher and pinned tools."""
+    return {
+        "Makefile": MAKE_INTERFACE,
+        "tests/container/run": (cd.CANON / "container" / "run").read_text(),
+        "tests/container/check": CONTAINER_HELPER,
+        "tests/container/Dockerfile": CONTAINER_DOCKER,
+        "tests/container/context": "tests/container/Dockerfile\ntests/container/check\n",
+    }
+
+
+class TestMakeWorkflowTargets:
+    def test_a_job_container_cannot_supply_hidden_make_environment_overrides(self):
+        text = TestWorkflowFindings.with_steps("      - run: make lint")
+        text = text.replace(
+            "    runs-on: ubuntu-latest",
+            "    runs-on: ubuntu-latest\n    container:\n      image: node:24\n      env: {MAKEFLAGS: -n}",
+        )
+        targets, found = cd.make_workflow_targets(text)
+        assert targets == set()
+        assert len(found) == 1
+
+    def test_the_canonical_make_lint_step_is_recognized(self):
+        step = (cd.CANON / "container" / "make-lint-step.yml").read_text()
+        text = TestWorkflowFindings.with_steps("\n".join("      " + line for line in step.splitlines()))
+        assert cd.make_workflow_targets(text) == ({"lint"}, [])
+
+    @pytest.mark.parametrize("target", ["check", "lint"])
+    def test_literal_make_categories_are_recognized(self, target):
+        text = TestWorkflowFindings.with_steps(f"      - run: make {target}")
+        assert cd.make_workflow_targets(text) == ({target}, [])
+
+    @pytest.mark.parametrize(
+        "step",
+        [
+            "run: make lint || true",
+            "run: make lint CHECK_TASKS=test",
+            "run: CHECK_TASKS=test make lint",
+            "run: make lint\n        continue-on-error: true",
+            "run: make lint\n        env: {PATH: /fake}",
+            "run: make lint\n        working-directory: elsewhere",
+            "run: make lint\n        if: false",
+            "run: make lint\n        shell: python",
+        ],
+    )
+    def test_masked_or_overridden_workflow_commands_carry_no_gate(self, step):
+        text = TestWorkflowFindings.with_steps(f"      - {step}")
+        targets, found = cd.make_workflow_targets(text)
+        assert targets == set()
+        assert len(found) == 1
+
+
+class TestMakeTasks:
+    def test_check_info_and_execution_share_literal_task_categories(self):
+        tasks, _ = cd.make_tasks(MAKE_INTERFACE)
+        assert tasks == ["lint", "test", "build"]
+
+    def test_custom_test_and_check_orchestration_does_not_replace_the_lint_proof(self):
+        text = MAKE_INTERFACE.replace("check lint test build exec:", "lint build exec:")
+        text += "check:\n\t@$(MAKE) lint test\ntest:\n\t@./tests/e2e/run\n"
+        tasks, _ = cd.make_tasks(text)
+        assert tasks == ["lint", "test", "build"]
+
+    def test_safe_go_shell_settings_and_unused_multiline_awk_do_not_override_lint(self):
+        text = MAKE_INTERFACE + "SHELL := /bin/bash\n.SHELLFLAGS := -o pipefail -c\nexport CGO_ENABLED := 0\n"
+        text += "PREFIX ?= /usr/local\nBINPREFIX ?= $(PREFIX)/bin\nQUIET := awk ' \\\n\t{ print $$0 }'\n"
+        tasks, _ = cd.make_tasks(text)
+        assert tasks == ["lint", "test", "build"]
+
+    @pytest.mark.parametrize(
+        ("before", "after"),
+        [
+            ("CHECK_TASKS := lint test build", "CHECK_TASKS := $(shell echo lint)"),
+            ("CHECK_TASKS := lint test build", "CHECK_TASKS := lint lint"),
+            ("export CHECK_TASKS CONTAINER_BUILD_ARGS", "export CONTAINER_BUILD_ARGS"),
+            ("@./tests/container/run $@", "@./tests/container/run $@ || true"),
+            ("@./tests/container/run info", '@printf \'{"version":1,"checks":["lint"]}\''),
+            (".DEFAULT_GOAL := check", "SHELL := true"),
+            (".DEFAULT_GOAL := check", ".IGNORE:"),
+            (".DEFAULT_GOAL := check", "UNRELATED := $(eval lint:;true)"),
+            (".DEFAULT_GOAL := check", "UNRELATED := ${shell true}"),
+            (".DEFAULT_GOAL := check", "CHECK_TASKS := test"),
+            (".DEFAULT_GOAL := check", "BASH_ENV := /fake"),
+            ("export CHECK_TASKS CONTAINER_BUILD_ARGS", "export CHECK_TASKS BASH_ENV"),
+            ("@./tests/container/run $@", "# Skip the next recipe \\\n\t@./tests/container/run $@"),
+        ],
+    )
+    def test_unsupported_make_control_or_dispatch_is_rejected(self, before, after):
+        with pytest.raises(ValueError, match=r".+"):
+            cd.make_tasks(MAKE_INTERFACE.replace(before, after))
+
+
+class TestContainerSteps:
+    @pytest.mark.parametrize("present", [True, False])
+    def test_theme_validation_is_an_explicit_existing_helper_before_markdown(self, present):
+        files = container_files()
+        files["tests/container/check"] = CONTAINER_HELPER.replace(
+            "ruff check .\n        ruff format --check .",
+            "python tests/container/validate.py",
+        )
+        if present:
+            files["tests/container/validate.py"] = "raise SystemExit(0)\n"
+            assert cd.container_steps({"lint"}, files) == {"markdownlint-cli2-action"}
+        else:
+            with pytest.raises(ValueError, match="missing tests/container/validate"):
+                cd.container_steps({"lint"}, files)
+
+    def test_parentheses_in_a_task_body_are_not_case_arm_labels(self):
+        files = container_files()
+        files["tests/container/check"] = CONTAINER_HELPER.replace(
+            "    *)",
+            "    build)\n        version=$(printf 1)\n        ;;\n    *)",
+        )
+        assert cd.container_steps({"lint"}, files) == {"markdownlint-cli2-action"}
+
+    def test_a_lint_label_nested_under_another_case_does_not_establish_reachability(self):
+        files = container_files()
+        files["tests/container/check"] = CONTAINER_HELPER.replace(
+            "    lint)",
+            '    test)\n        case "$other" in\n    lint)',
+        ).replace("esac\n", "        esac\n        ;;\nesac\n")
+        with pytest.raises(ValueError, match="nested or embedded"):
+            cd.container_steps({"lint"}, files)
+
+    def test_a_verified_container_carries_markdown_but_does_not_invent_shellcheck(self):
+        assert cd.container_steps({"lint"}, container_files()) == {"markdownlint-cli2-action"}
+
+    def test_check_runs_the_same_declared_lint_category(self):
+        assert cd.container_steps({"check"}, container_files()) == {"markdownlint-cli2-action"}
+
+    def test_a_test_only_task_list_carries_no_lint_tool(self):
+        files = container_files()
+        files["Makefile"] = MAKE_INTERFACE.replace("CHECK_TASKS := lint test build", "CHECK_TASKS := test")
+        assert cd.container_steps({"check"}, files) == set()
+
+    @pytest.mark.parametrize("prerequisite", ["CHECK_TASKS=test", "bypass"])
+    def test_check_prerequisites_cannot_replace_the_declared_lint_tasks(self, prerequisite):
+        files = container_files()
+        files["Makefile"] = MAKE_INTERFACE.replace("check lint test build exec:", "lint test build exec:")
+        files["Makefile"] += f"check: {prerequisite}\n\t@./tests/container/run $@\nbypass:\n\t@true\n"
+        with pytest.raises(ValueError, match="custom make check"):
+            cd.container_steps({"check"}, files)
+
+    def test_ci_may_select_verified_lint_beside_custom_test_and_check_targets(self):
+        files = container_files()
+        files["Makefile"] = MAKE_INTERFACE.replace("check lint test build exec:", "lint build exec:")
+        files["Makefile"] += "check:\n\t@$(MAKE) lint test\ntest:\n\t@./tests/e2e/run\n"
+        assert cd.container_steps({"lint"}, files) == {"markdownlint-cli2-action"}
+        with pytest.raises(ValueError, match="custom make check"):
+            cd.container_steps({"check"}, files)
+
+    def test_direct_ruby_lint_commands_keep_the_markdown_tool_proof(self):
+        files = container_files()
+        files["tests/container/check"] = CONTAINER_HELPER.replace(
+            "ruff check .\n        ruff format --check .",
+            "bundle exec rubocop\n        bundle exec srb tc",
+        )
+        files["tests/container/Dockerfile"] = "\n".join(DOCKER_PROFILES["ruby-mdtoc"]) + "\n"
+        files["tests/container/package.json"] = '{"dependencies":{"markdownlint-cli2":"0.24.0"}}'
+        files["tests/container/package-lock.json"] = (
+            '{"packages":{"node_modules/markdownlint-cli2":{"version":"0.24.0"}}}'
+        )
+        files["tests/container/context"] += "tests/container/package.json\ntests/container/package-lock.json\n"
+        assert cd.container_steps({"lint"}, files) == {"markdownlint-cli2-action"}
+
+    @pytest.mark.parametrize(
+        ("path", "before", "after"),
+        [
+            ("tests/container/run", "set -euo pipefail", "set -uo pipefail"),
+            ("tests/container/check", "set -eu", "set -u"),
+            ("tests/container/check", "category=${1:-check}", "exit 0\ncategory=${1:-check}"),
+            ("tests/container/check", 'case "${category}" in', "case test in"),
+            ("tests/container/check", "markdownlint-cli2", "markdownlint-cli2 || true"),
+            ("tests/container/check", "markdownlint-cli2", "echo markdownlint-cli2"),
+            ("tests/container/check", "        ;;", ""),
+            ("tests/container/check", "esac", "esac\nexit 0"),
+            ("tests/container/Dockerfile", "COPY tests/container/check /opt/check/run", "COPY absent /opt/check/run"),
+            ("tests/container/Dockerfile", "markdownlint-cli2@0.24.0", "markdownlint-cli2@0.23.2"),
+            ("tests/container/Dockerfile", "FROM node:24.22.2 AS markdown", "FROM other/image:24.22.2 AS markdown"),
+            ("tests/container/Dockerfile", "COPY --from=markdown /opt/markdown /opt/markdown", ""),
+            ("tests/container/Dockerfile", "ENV PATH=", "RUN printf true > /opt/check/run\nENV PATH="),
+            ("tests/container/Dockerfile", "/opt/check/venv/bin:", "/fake:"),
+            ("tests/container/context", "tests/container/check\n", ""),
+            (
+                "tests/container/check",
+                'case "${category}" in',
+                'case "${category}" in\n    *)\n        exit 0\n        ;;',
+            ),
+            (
+                "tests/container/Dockerfile",
+                "COPY tests/container/check /opt/check/run",
+                "RUN printf true > /usr/local/bin/markdownlint-cli2\nCOPY tests/container/check /opt/check/run",
+            ),
+            (
+                "tests/container/Dockerfile",
+                "COPY tests/container/check /opt/check/run",
+                "COPY fake /usr/local/bin/shellcheck\nCOPY tests/container/check /opt/check/run",
+            ),
+            (
+                "tests/container/Dockerfile",
+                "FROM koalaman/shellcheck:v0.11.0 AS shellcheck",
+                "FROM koalaman/shellcheck:v0.11.0 AS shellcheck\nRUN printf true > /bin/shellcheck",
+            ),
+            (
+                "tests/container/Dockerfile",
+                "FROM python:${PYTHON_VERSION}",
+                "FROM alpine AS shellcheck\nFROM python:${PYTHON_VERSION}",
+            ),
+        ],
+    )
+    def test_a_broken_link_in_the_make_to_tool_path_is_rejected(self, path, before, after):
+        files = container_files()
+        assert before in files[path]
+        files[path] = files[path].replace(before, after)
+        with pytest.raises(ValueError, match=r".+"):
+            cd.container_steps({"lint"}, files)
+
+    def test_shellcheck_needs_the_canonical_version_and_direct_flags(self):
+        files = container_files()
+        files["tests/container/check"] = CONTAINER_HELPER.replace(
+            "        markdownlint-cli2\n",
+            "        markdownlint-cli2\n        shellcheck -x -P SCRIPTDIR tests/container/run tests/container/check\n",
+        )
+        files["tests/container/Dockerfile"] = CONTAINER_DOCKER.replace("shellcheck:v0.11.0", "shellcheck:v0.10.0")
+        with pytest.raises(ValueError, match="Dockerfile"):
+            cd.container_steps({"lint"}, files)
+        files["tests/container/Dockerfile"] = CONTAINER_DOCKER
+        assert cd.container_steps({"lint"}, files) == {"action-shellcheck", "markdownlint-cli2-action"}
+
+    @pytest.mark.parametrize("version", ["0.24.0", "0.23.2"])
+    def test_the_nested_manifest_and_lockfile_must_both_pin_canon(self, version):
+        files = container_files()
+        files["tests/container/Dockerfile"] = "\n".join(DOCKER_PROFILES["python-nested"]) + "\n"
+        files["tests/container/package.json"] = json.dumps({"dependencies": {"markdownlint-cli2": "0.24.0"}})
+        files["tests/container/package-lock.json"] = json.dumps(
+            {"packages": {"node_modules/markdownlint-cli2": {"version": version}}},
+        )
+        files["tests/container/context"] += "tests/container/package.json\ntests/container/package-lock.json\n"
+        if version == "0.24.0":
+            assert cd.container_steps({"lint"}, files) == {"markdownlint-cli2-action"}
+        else:
+            with pytest.raises(ValueError, match=r"markdownlint-cli2 0\.24\.0"):
+                cd.container_steps({"lint"}, files)
+
+
+class TestMakeFindings:
+    @pytest.mark.parametrize(
+        "missing",
+        [
+            "Makefile",
+            "tests/container/run",
+            "tests/container/check",
+            "tests/container/Dockerfile",
+            "tests/container/context",
+        ],
+    )
+    def test_a_missing_contract_file_reports_drift_and_carries_no_tool(self, monkeypatch, missing):
+        files = container_files()
+        del files[missing]
+        patches, _ = repository(files)
+        monkeypatch.setattr(cd, "fetch", patches["fetch"])
+        found, carried = cd.make_findings({"lint"}, "demo")
+        assert found == [("Make checks", f"missing {missing}")]
+        assert carried == set()
+
+    @pytest.mark.parametrize("manifest", [None, [], {"dependencies": []}])
+    def test_a_malformed_nested_manifest_is_drift_instead_of_a_crash(self, monkeypatch, manifest):
+        files = container_files()
+        files["tests/container/Dockerfile"] = "\n".join(DOCKER_PROFILES["python-nested"]) + "\n"
+        files["tests/container/package.json"] = json.dumps(manifest)
+        files["tests/container/package-lock.json"] = "{}"
+        patches, _ = repository(files)
+        monkeypatch.setattr(cd, "fetch", patches["fetch"])
+        found, carried = cd.make_findings({"lint"}, "demo")
+        assert found[0][0] == "Make checks"
+        assert carried == set()
+
+    def test_a_missing_nested_lockfile_carries_no_tool(self, monkeypatch):
+        files = container_files()
+        files["tests/container/Dockerfile"] = "\n".join(DOCKER_PROFILES["python-nested"]) + "\n"
+        files["tests/container/package.json"] = '{"dependencies":{"markdownlint-cli2":"0.24.0"}}'
+        patches, _ = repository(files)
+        monkeypatch.setattr(cd, "fetch", patches["fetch"])
+        found, carried = cd.make_findings({"lint"}, "demo")
+        assert found == [("Make checks", "missing tests/container/package-lock.json")]
+        assert carried == set()
+
+    def test_a_malformed_make_contract_reports_drift_instead_of_claiming_a_gate(self, monkeypatch):
+        files = container_files()
+        files["Makefile"] = "CHECK_TASKS := $(shell echo lint)\n"
+        patches, _ = repository(files)
+        monkeypatch.setattr(cd, "fetch", patches["fetch"])
+        found, carried = cd.make_findings({"lint"}, "demo")
+        assert found[0][0] == "Make checks"
+        assert carried == set()
+
+    @pytest.mark.parametrize("languages", [(), ("Shell",)])
+    def test_check_keeps_action_refs_and_shell_absence_when_only_make_runs_markdown(self, monkeypatch, languages):
+        files = container_files()
+        files[".markdownlint-cli2.yaml"] = (cd.CANON / "markdown" / "markdownlint-cli2.yaml").read_text()
+        files[".github/workflows/ai-attributions.yml"] = (cd.CANON / "attributions" / "ai-attributions.yml").read_text()
+        files[".github/workflows/test.yml"] = TestWorkflowFindings.with_steps("      - run: make lint")
+        uses = {}
+        found, calls = TestCheck.run(monkeypatch, files, languages=languages, workflows=("test.yml",), uses=uses)
+        assert found == [("ShellCheck step", "no ShellCheck step in any workflow, and the repository holds shell")]
+        assert "Makefile" in calls
+        assert "languages/Shell" not in calls
+        assert sorted(uses) == ["actions/checkout"]
+
+    def test_make_coverage_does_not_hide_a_drifted_action_or_its_second_pin(self, monkeypatch):
+        files = container_files()
+        files[".markdownlint-cli2.yaml"] = (cd.CANON / "markdown" / "markdownlint-cli2.yaml").read_text()
+        files[".github/workflows/ai-attributions.yml"] = (cd.CANON / "attributions" / "ai-attributions.yml").read_text()
+        files[".github/workflows/test.yml"] = TestWorkflowFindings.with_steps(
+            CANONICAL_STEPS.replace('globs: ""', 'globs: "**/*.md"') + "\n      - run: make lint",
+        )
+        uses = {}
+        found, _ = TestCheck.run(monkeypatch, files, workflows=("test.yml",), uses=uses)
+        assert [label for label, _ in found] == ["markdownlint step (test.yml)", "markdownlint step"]
+        assert "two pins" in found[1][1]
+        assert "DavidAnson/markdownlint-cli2-action" in uses
+
+
+class TestDockerSetupStep:
+    def test_a_present_docker_setup_step_matches_its_engine_pin(self):
+        step = (cd.CANON / "container" / "docker-setup-step.yml").read_text()
+        text = TestWorkflowFindings.with_steps("\n".join("      " + line for line in step.splitlines()))
+        found, stepped = cd.workflow_findings("test.yml", text)
+        assert found == []
+        assert stepped == {"setup-docker-action"}
+
+    def test_a_different_docker_engine_is_reported_without_waiving_other_checks(self):
+        step = (cd.CANON / "container" / "docker-setup-step.yml").read_text()
+        step = step.replace("v29.9.3", "v28.1.0")
+        text = TestWorkflowFindings.with_steps("\n".join("      " + line for line in step.splitlines()))
+        found, stepped = cd.workflow_findings("test.yml", text)
+        assert [label for label, _ in found] == ["Docker setup step (test.yml: lint, step 2)"]
+        assert stepped == {"setup-docker-action"}
+
+    def test_a_correct_first_bootstrap_cannot_hide_a_later_job_engine_mismatch(self):
+        step = (cd.CANON / "container" / "docker-setup-step.yml").read_text()
+        text = TestWorkflowFindings.with_steps("\n".join("      " + line for line in step.splitlines()))
+        later = step.replace("v29.9.3", "v28.1.0")
+        text += "\n  release:\n    timeout-minutes: 15\n    runs-on: ubuntu-latest\n    steps:\n"
+        text += "\n".join("      " + line for line in later.splitlines()) + "\n"
+        found, _ = cd.workflow_findings("test.yml", text)
+        assert [label for label, _ in found] == ["Docker setup step (test.yml: release, step 1)"]
+
+
+HELPER_PROFILES = json.loads((cd.CANON / "container" / "check-profiles.json").read_text())["helpers"]
+
+
+def profiled_files(profile, markdown=True):
+    """A fixed dispatch profile with direct lint commands and inspected image wiring."""
+    files = container_files()
+    family = "node" if profile.startswith("node") else profile
+    files["tests/container/Dockerfile"] = "\n".join(DOCKER_PROFILES[family]) + "\n"
+    helper = HELPER_PROFILES[profile]["wrapper"]
+    if family == "node":
+        body = (
+            "        shellcheck -x -P SCRIPTDIR tests/container/run tests/container/check "
+            "tests/container/staged tests/container/staged-git\n        npm run internal:lint\n"
+        )
+        helper = helper.replace("        : CHECK_LINT\n", body)
+        helper = helper.replace("        : CHECK_TEST\n", "        npm run internal:test\n")
+        helper = helper.replace("        : CHECK_BUILD\n", "        npm run internal:build\n")
+        script = "prettier --check . && eslint --max-warnings 0 ."
+        if markdown:
+            script += " && markdownlint-cli2"
+        files["package.json"] = json.dumps(
+            {"scripts": {"internal:lint": script}, "devDependencies": {"markdownlint-cli2": "0.24.0"}},
+        )
+        files["package-lock.json"] = json.dumps({"packages": {"node_modules/markdownlint-cli2": {"version": "0.24.0"}}})
+        files["tests/container/context"] += "package.json\npackage-lock.json\n"
+        for path in ("tests/container/staged", "tests/container/staged-git"):
+            files[path] = "#!/bin/sh\nexit 0\n"
+        files["Makefile"] = MAKE_INTERFACE.replace(
+            "PYTHON_VERSION=$(shell cat .python-version)",
+            "NODE_VERSION=$(shell sed 's/^v//' .nvmrc)",
+        )
+    else:
+        for name in ("CHECK", "EXEC", "LINT", "TEST", "BUILD", "*"):
+            body = HELPER_PROFILES[profile]["lint"] if name == "LINT" else "        exit 2\n"
+            helper = helper.replace(f"        : CHECK_{name}\n", body)
+        helper = helper.replace("REPOSITORY", "https://github.com/andornaut/demo.git")
+        if profile == "go":
+            files["Makefile"] = MAKE_INTERFACE.replace(
+                "PYTHON_VERSION=$(shell cat .python-version)",
+                "GO_VERSION=$(shell awk '$$1 == \"go\" {print $$2; exit}' go.mod)",
+            )
+        else:
+            for path in ("scripts/test-in-container", ".cargo-husky/hooks/pre-commit"):
+                files[path] = "#!/bin/sh\nexit 0\n"
+    files["tests/container/check"] = helper
+    return files
+
+
+class TestContainerProfiles:
+    @pytest.mark.parametrize("field", ["internal:check:types", "preinternal:check:types"])
+    def test_node_type_checking_cannot_override_lint_commands(self, field):
+        files = profiled_files("node")
+        files["tests/container/check"] = files["tests/container/check"].replace(
+            "        npm run internal:lint",
+            "        npm run internal:check:types\n        npm run internal:lint",
+        )
+        manifest = json.loads(files["package.json"])
+        manifest["scripts"]["internal:check:types"] = "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json"
+        manifest["scripts"][field] = "true"
+        files["package.json"] = json.dumps(manifest)
+        with pytest.raises(ValueError, match="Node type checking"):
+            cd.container_steps({"lint"}, files)
+
+    @pytest.mark.parametrize("profile", ["node", "node-svelte", "go", "rust"])
+    def test_inspected_profiles_reach_both_pinned_tools(self, profile):
+        files = profiled_files(profile)
+        assert cd.helper_profile(files["tests/container/check"])[0] == profile
+        assert cd.container_steps({"lint"}, files) == {"action-shellcheck", "markdownlint-cli2-action"}
+
+    def test_a_node_script_without_markdown_carries_only_shellcheck(self):
+        assert cd.container_steps({"lint"}, profiled_files("node", markdown=False)) == {"action-shellcheck"}
+
+    @pytest.mark.parametrize("profile", ["node", "go", "rust"])
+    def test_profile_cache_initialization_cannot_be_replaced_by_an_early_exit(self, profile):
+        helper = profiled_files(profile)["tests/container/check"].replace("set -eu", "set -eu\nexit 0")
+        with pytest.raises(ValueError, match="dispatch profiles"):
+            cd.helper_profile(helper)
+
+    @pytest.mark.parametrize("profile", ["node", "go", "rust"])
+    def test_profiled_lint_commands_cannot_mask_a_failure(self, profile):
+        files = profiled_files(profile)
+        before = "npm run internal:lint" if profile == "node" else "markdownlint-cli2"
+        files["tests/container/check"] = files["tests/container/check"].replace(before, before + " || true")
+        with pytest.raises(ValueError, match=r".+"):
+            cd.container_steps({"lint"}, files)
+
+    @pytest.mark.parametrize("field", ["internal:lint", "preinternal:lint", "postinternal:lint"])
+    def test_node_scripts_and_lifecycle_hooks_cannot_mask_the_tool(self, field):
+        files = profiled_files("node")
+        manifest = json.loads(files["package.json"])
+        manifest["scripts"][field] = "true"
+        files["package.json"] = json.dumps(manifest)
+        with pytest.raises(ValueError, match="Node internal:lint"):
+            cd.container_steps({"lint"}, files)
+
+    def test_node_markdown_must_match_the_installed_lock_version(self):
+        files = profiled_files("node")
+        files["package-lock.json"] = files["package-lock.json"].replace("0.24.0", "0.23.2")
+        with pytest.raises(ValueError, match="locked markdownlint"):
+            cd.container_steps({"lint"}, files)
+
+    def test_node_fetches_root_manifests_and_referenced_staged_helpers(self, monkeypatch):
+        files = profiled_files("node")
+        patches, calls = repository(files)
+        monkeypatch.setattr(cd, "fetch", patches["fetch"])
+        assert cd.make_findings({"lint"}, "demo") == ([], {"action-shellcheck", "markdownlint-cli2-action"})
+        assert "package.json" in calls
+        assert "package-lock.json" in calls
+        assert "tests/container/staged-git" in calls
+        assert "tests/container/package.json" not in calls
+
+    def test_node_missing_staged_shell_input_is_not_a_success(self, monkeypatch):
+        files = profiled_files("node")
+        del files["tests/container/staged-git"]
+        patches, _ = repository(files)
+        monkeypatch.setattr(cd, "fetch", patches["fetch"])
+        found, carried = cd.make_findings({"lint"}, "demo")
+        assert found == [("Make checks", "missing tests/container/staged-git")]
+        assert carried == set()
+
+    def test_docker_parser_directives_are_part_of_the_profile(self):
+        files = profiled_files("go")
+        files["tests/container/Dockerfile"] = files["tests/container/Dockerfile"].replace(
+            "# syntax=docker/dockerfile:1.25",
+            "# syntax=other/frontend:latest",
+        )
+        with pytest.raises(ValueError, match="Dockerfile"):
+            cd.container_steps({"lint"}, files)

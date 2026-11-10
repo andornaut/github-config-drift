@@ -511,7 +511,449 @@ def step_finding(drop, label, canon_step, theirs):
 WORKFLOW_STEPS = (
     ("action-shellcheck", "ShellCheck step", ("shell", "shellcheck-step.yml"), SHELL_LOCAL),
     ("markdownlint-cli2-action", "markdownlint step", ("markdown", "markdownlint-step.yml"), ()),
+    ("setup-docker-action", "Docker setup step", ("container", "docker-setup-step.yml"), ()),
 )
+
+
+def make_workflow_targets(text):
+    """Literal Make categories that an unmasked workflow step actually runs."""
+    document = yaml.safe_load(text)
+    targets = set()
+    complaints = []
+    if not isinstance(document, dict):
+        return targets, complaints
+    for job in (document.get("jobs") or {}).values():
+        if not isinstance(job, dict):
+            continue
+        for step in job.get("steps") or []:
+            if not isinstance(step, dict):
+                continue
+            command = step.get("run", "")
+            if not isinstance(command, str) or not re.search(r"\bmake\s+(?:check|lint)\b", command):
+                continue
+            match = re.fullmatch(r"make (check|lint)", command.strip())
+            if (
+                match is None
+                or any(owner.get("continue-on-error") or owner.get("env") for owner in (document, job, step))
+                or any(owner.get("if") not in (None, "success()") for owner in (job, step))
+                or any(owner.get("defaults") for owner in (document, job))
+                or step.get("working-directory")
+                or step.get("shell") not in (None, "bash", "sh")
+                or job.get("container")
+            ):
+                complaints.append("Make lint coverage requires an unconditional, unmasked make check or make lint step")
+            else:
+                targets.add(match[1])
+    return targets, complaints
+
+
+def make_tasks(text):
+    """Read the restricted Make interface without evaluating any repository code."""
+    tasks = None
+    exported = False
+    recipes = {}
+    variables = {}
+    current = ()
+    lines = iter(text.splitlines())
+    for physical in lines:
+        line = physical
+        if not line.strip():
+            continue
+        if line.startswith("\t"):
+            if not current:
+                raise ValueError("Make recipe has no literal target")
+            if line.rstrip().endswith("\\") and set(current).intersection({"lint", "check-info"}):
+                raise ValueError("Make lint recipes must not use line continuations")
+            if line.lstrip().startswith("#"):
+                continue
+            for target in current:
+                recipes[target].append(line.strip())
+            continue
+        if line.lstrip().startswith("#"):
+            if line.rstrip().endswith("\\"):
+                raise ValueError("Make comments must not continue over check declarations")
+            continue
+        while line.rstrip().endswith("\\"):
+            following = next(lines, None)
+            if following is None:
+                raise ValueError("Make declaration has an unterminated continuation")
+            line = line.rstrip()[:-1] + " " + following.strip()
+        current = ()
+        if match := re.fullmatch(r"CHECK_TASKS\s*:=\s*((?:lint|test|build)(?:\s+(?:lint|test|build))*)\s*", line):
+            if tasks is not None:
+                raise ValueError("CHECK_TASKS must have one literal assignment")
+            tasks = match[1].split()
+            if len(tasks) != len(set(tasks)):
+                raise ValueError("CHECK_TASKS contains duplicate categories")
+        elif re.fullmatch(r"export CGO_ENABLED\s*(?::=|=)\s*[01]", line):
+            pass
+        elif line.startswith("export "):
+            names = line.removeprefix("export ").split()
+            allowed_exports = {
+                "CHECK_TASKS",
+                "BUILD_OUTPUTS",
+                "CONTAINER_BUILD_ARGS",
+                "TEST_ARGS",
+                "COMMAND",
+                "CHECK_TIMEOUT_SECONDS",
+                "CHECK_MEMORY",
+                "CHECK_SCRATCH_SIZE",
+                "CHECK_WORK_SIZE",
+                "CHECK_TMP_SIZE",
+                "CHECK_NETWORK_LINT",
+                "CONTAINER_IMAGE",
+            }
+            if not names or not set(names) <= allowed_exports:
+                raise ValueError("Make exports must name only check interface variables")
+            exported |= "CHECK_TASKS" in names
+        elif (
+            re.fullmatch(r"\.DEFAULT_GOAL\s*:=\s*check", line)
+            or re.fullmatch(r"\.PHONY:\s*[a-z0-9 /_.-]+", line)
+            or re.fullmatch(r"SHELL\s*:=\s*/bin/(?:bash|sh)", line)
+            or re.fullmatch(r"\.SHELLFLAGS\s*:=\s*(?:-o pipefail -c|-ec|-e -c)", line)
+        ):
+            pass
+        elif match := re.fullmatch(r"([a-z0-9 /_.-]+):(.*)", line):
+            current = tuple(match[1].split())
+            if set(current).intersection({"lint", "check-info"}) and match[2].strip():
+                raise ValueError("Make lint and check-info must dispatch without custom prerequisites")
+            if "$" in match[2]:
+                raise ValueError("Make prerequisites must be literal")
+            if any(target in recipes for target in current):
+                raise ValueError("Make targets must have one recipe")
+            for target in current:
+                recipes[target] = ["[prerequisites] " + match[2].strip()] if match[2].strip() else []
+        elif match := re.fullmatch(r"\$\(([A-Z_]+)\): [a-z]+", line):
+            target = variables.get(match[1])
+            if not target or target in {"lint", "check", "check-info", "Makefile", "GNUmakefile", "makefile"}:
+                raise ValueError("Make aliases must name an unrelated literal build output")
+        elif re.fullmatch(r"override (COMMAND|TEST_ARGS) := \$\(value \1\)", line):
+            pass
+        elif match := re.fullmatch(r"([A-Z_]+)\s*(?::=|\?=|=)(.*)", line):
+            if match[1] in {
+                "CHECK_TASKS",
+                "SHELL",
+                "MAKEFLAGS",
+                "MFLAGS",
+                "MAKEFILES",
+                "PATH",
+                "BASH_ENV",
+                "ENV",
+                "LD_PRELOAD",
+            }:
+                raise ValueError("Make control overrides are unsupported")
+            literal = re.sub(r"\$\(shell cat \.(?:python-version|ruby-version|nvmrc)\)", "", line)
+            literal = literal.replace("$(shell sed 's/^v//' .nvmrc)", "")
+            literal = literal.replace("$(shell awk '$$1 == \"go\" {print $$2; exit}' go.mod)", "")
+            literal = re.sub(r"\$\([A-Z_]+\)|\$\{[A-Z_]+\}|\$\$", "", literal)
+            if "$" in literal:
+                raise ValueError("Make assignments contain unsupported expansion")
+            value = match[2].strip()
+            variables[match[1]] = value if re.fullmatch(r"[A-Za-z0-9_./-]+", value) else None
+        else:
+            raise ValueError("Make syntax is outside the literal check interface")
+    if tasks is None or not exported:
+        raise ValueError("Make must declare and export literal CHECK_TASKS")
+    for target in ("lint",):
+        if recipes.get(target) != ["@./tests/container/run $@"]:
+            raise ValueError(f"Make {target} must dispatch directly to tests/container/run")
+    if recipes.get("check-info") != ["@./tests/container/run info"]:
+        raise ValueError("Make check-info must read the same runner task list")
+    return tasks, recipes
+
+
+def helper_profile(text):
+    """Recognize fixed dispatch wrappers and inspect their selected lint body."""
+    if "\nrun_task() {\n" not in text and 'command=$1\nshift\ncase "$command" in' not in text:
+        return None, None
+    profiles = json.loads((CANON / "container" / "check-profiles.json").read_text())["helpers"]
+    for name, profile in profiles.items():
+        categories = "lint|test|build" if name.startswith("node") else r"check|exec|lint|test|build|\*"
+        pattern = rf"^    ({categories})\)\n(.*?)^        ;;$"
+        matches = list(re.finditer(pattern, text, re.MULTILINE | re.DOTALL))
+        wrapper = re.sub(
+            pattern,
+            lambda match: f"    {match[1]})\n        : CHECK_{match[1].upper()}\n        ;;",
+            text,
+            flags=re.MULTILINE | re.DOTALL,
+        )
+        if wrapper != profile["wrapper"]:
+            continue
+        lint = next(match[2] for match in matches if match[1] == "lint")
+        if name.startswith("node"):
+            for match in matches:
+                if match[1] != "lint" and any(
+                    not re.fullmatch(r'npm run internal:[a-z0-9:-]+(?: -- [a-zA-Z0-9_./=$@" -]+)?', line.strip())
+                    for line in match[2].splitlines()
+                    if line.strip()
+                ):
+                    raise ValueError("Node task bodies must dispatch directly to internal npm scripts")
+        elif re.sub(r"https://github.com/andornaut/[A-Za-z0-9_-]+\.git", "REPOSITORY", lint) != profile["lint"]:
+            raise ValueError(f"the {name} lint body differs from its inspected command profile")
+        return name, [line.strip() for line in lint.splitlines() if line.strip()]
+    raise ValueError("container task helper differs from the inspected dispatch profiles")
+
+
+def node_container_steps(commands, files):
+    """Follow the Node wrapper through its frozen install and internal lint script."""
+    pin = yaml.safe_load((CANON / "shell" / "shellcheck-step.yml").read_text())[0]["with"]["version"]
+    docker = [line.strip() for line in files["tests/container/Dockerfile"].splitlines()]
+    docker = [line for line in docker if line and not line.startswith("#")]
+    expected = [
+        f"FROM koalaman/shellcheck:{pin} AS shellcheck",
+        "FROM node:${NODE_VERSION}",
+        "COPY --from=shellcheck /bin/shellcheck /usr/local/bin/shellcheck",
+        "ENV HUSKY=0",
+        "WORKDIR /opt/dependencies",
+        "COPY package.json package-lock.json ./",
+        "RUN npm ci --ignore-scripts --no-audit --no-fund",
+        "COPY tests/container/check /opt/check/run",
+    ]
+    if not docker or not re.fullmatch(r"ARG NODE_VERSION=[0-9.]+", docker[0]) or docker[1:] != expected:
+        raise ValueError("Node container must preserve its pinned tools, frozen install and task helper wiring")
+    context = set(files["tests/container/context"].splitlines())
+    if not {"tests/container/Dockerfile", "tests/container/check", "package.json", "package-lock.json"} <= context:
+        raise ValueError("Node container context omits its helper or package manifests")
+    shell = "shellcheck -x -P SCRIPTDIR tests/container/run tests/container/check"
+    staged = shell + " tests/container/staged tests/container/staged-git"
+    if commands not in (
+        [shell, "npm run internal:lint"],
+        [staged, "npm run internal:lint"],
+        [staged, "npm run internal:check:types", "npm run internal:lint"],
+    ):
+        raise ValueError("Node lint must run direct ShellCheck and internal:lint commands")
+    for path in commands[0].split()[4:]:
+        if not files.get(path):
+            raise ValueError(f"missing ShellCheck input {path}")
+    manifest = json.loads(files["package.json"])
+    lock = json.loads(files["package-lock.json"])
+    if not isinstance(manifest, dict) or not isinstance(lock, dict) or not isinstance(manifest.get("scripts"), dict):
+        raise TypeError("Node lint manifests must declare their internal scripts")
+    scripts = manifest["scripts"]
+    if "npm run internal:check:types" in commands and (
+        scripts.get("internal:check:types") != "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json"
+        or any(name in scripts for name in ("preinternal:check:types", "postinternal:check:types"))
+    ):
+        raise ValueError("Node type checking must use its direct inspected script without lifecycle overrides")
+    script = scripts.get("internal:lint")
+    if not isinstance(script, str) or any(name in scripts for name in ("preinternal:lint", "postinternal:lint")):
+        raise ValueError("Node internal:lint must be a direct, unmasked script")
+    chain = script.split(" && ")
+    if any(
+        command not in {"prettier --check .", "eslint --max-warnings 0 .", "markdownlint-cli2"} for command in chain
+    ):
+        raise ValueError("Node internal:lint must contain direct, unmasked lint commands")
+    carried = {"action-shellcheck"}
+    if "markdownlint-cli2" in chain:
+        version = json.loads((CANON / "container" / "tools.json").read_text())["markdownlint-cli2"]
+        dependencies = manifest.get("devDependencies", {})
+        packages = lock.get("packages", {})
+        if (
+            not isinstance(dependencies, dict)
+            or dependencies.get("markdownlint-cli2") not in {version, "^" + version, "~" + version}
+            or not isinstance(packages, dict)
+            or not isinstance(packages.get("node_modules/markdownlint-cli2"), dict)
+            or packages["node_modules/markdownlint-cli2"].get("version") != version
+        ):
+            raise ValueError(f"Node lint must install locked markdownlint-cli2 {version}")
+        carried.add("markdownlint-cli2-action")
+    return carried
+
+
+def docker_instructions(text):
+    """Retain Docker parser directives and logical instructions for exact profiles."""
+    return [
+        line.strip()
+        for line in text.replace("\\\n", " ").splitlines()
+        if line.strip() and (not line.lstrip().startswith("#") or re.match(r"#\s*(?:syntax|escape|check)=", line))
+    ]
+
+
+def container_steps(targets, files):
+    """Prove the bounded Make-to-container lint path from committed source only."""
+    tasks, recipes = make_tasks(files["Makefile"])
+    if "lint" not in tasks or not targets.intersection({"lint", "check"}):
+        return set()
+    if "lint" not in targets and recipes.get("check") != ["@./tests/container/run $@"]:
+        raise ValueError("a custom make check recipe does not establish container lint coverage; select make lint")
+    if files["tests/container/run"] != (CANON / "container" / "run").read_text():
+        raise ValueError("tests/container/run differs from the canonical dispatcher")
+    profiles = json.loads((CANON / "container" / "check-profiles.json").read_text())
+    if docker_instructions(files["tests/container/Dockerfile"]) not in profiles["dockerfiles"].values():
+        raise ValueError("Dockerfile differs from the inspected container instruction profiles")
+    helper = files["tests/container/check"]
+    profile, profiled_commands = helper_profile(helper)
+    if profile is not None and profile.startswith("node"):
+        return node_container_steps(profiled_commands, files)
+    if profile is not None:
+        helper = (
+            "#!/bin/sh\nset -eu\ncategory=${1:-check}\n"
+            'if [ "$#" -gt 0 ]; then shift; fi\ncase "$category" in\n    lint)\n'
+        )
+        helper += (
+            "".join(f"        {command}\n" for command in profiled_commands)
+            + "        ;;\n    *)\n        exit 2\n        ;;\nesac\n"
+        )
+    cases = list(re.finditer(r'^case "\$(?:category|\{category\})" in$', helper, re.MULTILINE))
+    if len(cases) != 1:
+        raise ValueError("container task helper needs one literal category case")
+    if len(re.findall(r"\b(?:case|esac)\b", helper)) != 2:
+        raise ValueError("plain container helpers must have one case without nested or embedded cases")
+    preamble = [line for line in helper[: cases[0].start()].splitlines() if line]
+    if preamble[:3] != ["#!/bin/sh", "set -eu", "category=${1:-check}"] or preamble[3:] not in (
+        ['[ "$#" -eq 0 ] || shift'],
+        ['if [ "$#" -gt 0 ]; then shift; fi'],
+    ):
+        raise ValueError("container task helper needs an unmasked literal category preamble")
+    if not helper.rstrip().endswith("\nesac") or len(re.findall(r"^    lint\)$", helper, re.MULTILINE)) != 1:
+        raise ValueError("container task helper has malformed category cases")
+    labels = re.findall(r"^    ([^ \t].*)\)$", helper, re.MULTILINE)
+    if (
+        not labels
+        or labels[-1] != "*"
+        or len(labels) != len(set(labels))
+        or not set(labels) <= {"check", "lint", "test", "build", "exec", "*"}
+        or len(re.findall(r"^        ;;$", helper, re.MULTILINE)) != len(labels)
+    ):
+        raise ValueError("container lint case must be reachable before one final wildcard")
+    match = re.search(r"^    lint\)\n(.*?)^        ;;$", helper, re.MULTILINE | re.DOTALL)
+    if match is None:
+        raise ValueError("container task helper has no terminated lint case")
+    commands = [line.strip() for line in match[1].splitlines() if line.strip() and not line.lstrip().startswith("#")]
+    allowed = {
+        "ruff check .",
+        "ruff format --check .",
+        "markdownlint-cli2",
+        "bundle exec rubocop",
+        "bundle exec srb tc",
+        "python tests/container/validate.py",
+    }
+    shellcheck = "shellcheck -x -P SCRIPTDIR tests/container/run tests/container/check"
+    if not commands or (profile is None and any(command not in allowed | {shellcheck} for command in commands)):
+        raise ValueError("container lint case must contain direct, unmasked supported tool commands")
+    if "python tests/container/validate.py" in commands and not files.get("tests/container/validate.py"):
+        raise ValueError("missing tests/container/validate.py")
+    docker = [line.strip() for line in files["tests/container/Dockerfile"].replace("\\\n", " ").splitlines()]
+    docker = [line for line in docker if line and not line.startswith("#")]
+    final = max((index for index, line in enumerate(docker) if line.startswith("FROM ")), default=-1)
+    helper_copy = "COPY tests/container/check /opt/check/run"
+    if final < 0 or docker[final:].count(helper_copy) != 1:
+        raise ValueError("final container stage must copy tests/container/check to /opt/check/run")
+    version = json.loads((CANON / "container" / "tools.json").read_text())["markdownlint-cli2"]
+    global_install = f"RUN npm install --global --ignore-scripts --no-audit --no-fund markdownlint-cli2@{version}"
+    global_style = global_install in docker[:final]
+    context = set(files["tests/container/context"].splitlines())
+    if not {"tests/container/Dockerfile", "tests/container/check"} <= context:
+        raise ValueError("container build context omits its Dockerfile or task helper")
+    carried = set()
+    if "markdownlint-cli2" in commands:
+        pin = json.loads((CANON / "container" / "tools.json").read_text())["markdownlint-cli2"]
+        stages = [
+            index for index, line in enumerate(docker[:final]) if re.fullmatch(r"FROM node:[0-9.]+ AS markdown", line)
+        ]
+        if len(stages) != 1:
+            raise ValueError("Markdown tools need one pinned official Node build stage")
+        next_stage = next(index for index in range(stages[0] + 1, len(docker)) if docker[index].startswith("FROM "))
+        stage = docker[stages[0] + 1 : next_stage]
+        direct = f"RUN npm install --prefix /opt/markdown --no-audit --no-fund --ignore-scripts markdownlint-cli2@{pin}"
+        installed = stage in ([direct], [global_install])
+        if profile == "rust":
+            extra = profiles["helpers"]["rust"]["markdown_extra"]
+            installed |= stage == [global_install, extra]
+        if not installed and stage == [
+            "WORKDIR /opt/markdown",
+            "COPY tests/container/package.json tests/container/package-lock.json ./",
+            "RUN npm ci --ignore-scripts --no-audit --no-fund",
+        ]:
+            manifest = json.loads(files["tests/container/package.json"])
+            lock = json.loads(files["tests/container/package-lock.json"])
+            if not isinstance(manifest, dict) or not isinstance(lock, dict):
+                raise ValueError("container Markdown manifests must be objects")
+            dependencies = manifest.get("dependencies")
+            packages = lock.get("packages")
+            if (
+                not isinstance(dependencies, dict)
+                or not isinstance(packages, dict)
+                or not isinstance(packages.get("node_modules/markdownlint-cli2"), dict)
+            ):
+                raise ValueError("container Markdown manifests must name their installed tool")
+            installed = (
+                dependencies.get("markdownlint-cli2") == pin
+                and packages["node_modules/markdownlint-cli2"].get("version") == pin
+                and {"tests/container/package.json", "tests/container/package-lock.json"} <= context
+                and "COPY tests/container/package.json tests/container/package-lock.json ./" in docker[:final]
+                and "WORKDIR /opt/markdown" in docker[:final]
+            )
+        wiring = {"COPY --from=markdown /usr/local/bin/node /usr/local/bin/node"}
+        if global_style:
+            wiring |= {
+                "COPY --from=markdown /usr/local/lib/node_modules /usr/local/lib/node_modules",
+                (
+                    "RUN ln -s /usr/local/lib/node_modules/markdownlint-cli2/"
+                    "markdownlint-cli2-bin.mjs /usr/local/bin/markdownlint-cli2"
+                ),
+            }
+        else:
+            wiring.add("COPY --from=markdown /opt/markdown /opt/markdown")
+        if not installed or not wiring <= set(docker[final:]):
+            raise ValueError(f"container must install and carry markdownlint-cli2 {pin}")
+        carried.add("markdownlint-cli2-action")
+    shell_command = next((command for command in commands if command.startswith("shellcheck -x -P SCRIPTDIR ")), None)
+    if shell_command is not None:
+        pin = yaml.safe_load((CANON / "shell" / "shellcheck-step.yml").read_text())[0]["with"]["version"]
+        if f"FROM koalaman/shellcheck:{pin} AS shellcheck" not in docker[:final] or (
+            "COPY --from=shellcheck /bin/shellcheck /usr/local/bin/shellcheck" not in docker[final:]
+        ):
+            raise ValueError(f"container must install and carry ShellCheck {pin}")
+        for path in shell_command.split()[4:]:
+            if not files.get(path):
+                raise ValueError(f"missing ShellCheck input {path}")
+        carried.add("action-shellcheck")
+    return carried
+
+
+def make_findings(targets, repo):
+    """Fetch a Make contract only after CI selects its literal check categories."""
+    paths = (
+        "Makefile",
+        "tests/container/run",
+        "tests/container/check",
+        "tests/container/Dockerfile",
+        "tests/container/context",
+    )
+    files = {}
+    for path in paths:
+        content = fetch(repo, path)
+        if content is None:
+            return [("Make checks", f"missing {path}")], set()
+        files[path] = decode(content)
+    if "RUN npm ci --ignore-scripts --no-audit --no-fund" in files["tests/container/Dockerfile"]:
+        manifests = (
+            ("package.json", "package-lock.json")
+            if "\nrun_task() {\n" in files["tests/container/check"]
+            else ("tests/container/package.json", "tests/container/package-lock.json")
+        )
+        for path in manifests:
+            content = fetch(repo, path)
+            if content is None:
+                return [("Make checks", f"missing {path}")], set()
+            files[path] = decode(content)
+    for path in (
+        "tests/container/staged",
+        "tests/container/staged-git",
+        "scripts/test-in-container",
+        ".cargo-husky/hooks/pre-commit",
+        "tests/container/validate.py",
+    ):
+        if path in files["tests/container/check"]:
+            content = fetch(repo, path)
+            if content is None:
+                return [("Make checks", f"missing {path}")], set()
+            files[path] = decode(content)
+    try:
+        return [], container_steps(targets, files)
+    except (ValueError, TypeError, KeyError) as error:
+        return [("Make checks", str(error))], set()
 
 
 def workflow_findings(name, text):
@@ -524,6 +966,18 @@ def workflow_findings(name, text):
     found = [(f"workflow shape ({name})", complaint) for complaint in workflow_shape(text)]
     stepped = set()
     for action, label, canon_path, drop in WORKFLOW_STEPS:
+        if action == "setup-docker-action":
+            document = yaml.safe_load(text)
+            for job_id, job in (document.get("jobs") or {}).items():
+                for index, step in enumerate(job.get("steps") or [], 1):
+                    if "docker/setup-docker-action@" not in str(step.get("uses", "")):
+                        continue
+                    stepped.add(action)
+                    canon_step = yaml.safe_load(CANON.joinpath(*canon_path).read_text())[0]
+                    finding = step_finding(drop, f"{label} ({name}: {job_id}, step {index})", canon_step, step)
+                    if finding:
+                        found.append(finding)
+            continue
         theirs = workflow_step(text, action)
         if theirs is None:
             continue
@@ -552,7 +1006,7 @@ def pins_markdownlint(repo):
     return any("markdownlint-cli2" in (tree.get(key) or {}) for key in ("dependencies", "devDependencies"))
 
 
-def absent_step_findings(holds, repo, stepped):
+def absent_step_findings(holds, repo, stepped, container_stepped=(), container_shell=False):
     """Findings for a canonical step no workflow in the repository carries.
 
     Comparing a step only where one exists says nothing about a repository that
@@ -563,10 +1017,14 @@ def absent_step_findings(holds, repo, stepped):
     repository holding its own pin is running the tool from that.
     """
     found = []
-    if "action-shellcheck" not in stepped and repo not in SHELL_EXEMPT and holds("Shell"):
+    if (
+        "action-shellcheck" not in set(stepped) | set(container_stepped)
+        and repo not in SHELL_EXEMPT
+        and (container_shell or holds("Shell"))
+    ):
         found.append(("ShellCheck step", "no ShellCheck step in any workflow, and the repository holds shell"))
     pinned = pins_markdownlint(repo)
-    if "markdownlint-cli2-action" not in stepped and not pinned:
+    if "markdownlint-cli2-action" not in set(stepped) | set(container_stepped) and not pinned:
         found.append(
             ("markdownlint step", "no markdownlint step in any workflow, and every repository here holds Markdown")
         )
@@ -581,6 +1039,8 @@ def absent_step_findings(holds, repo, stepped):
                 ),
             )
         )
+    if "markdownlint-cli2-action" in stepped and "markdownlint-cli2-action" in container_stepped:
+        found.append(("markdownlint step", "the action step and a container pin are two pins of one tool"))
     return found
 
 
@@ -652,6 +1112,7 @@ def check(repo, uses=None):
         found.append((".github/workflows/ai-attributions.yml", "no attributions workflow"))
 
     stepped = set()
+    make_targets = set()
     for name in workflow_names(repo):
         content = fetch(repo, f".github/workflows/{name}")
         if content is None:
@@ -660,11 +1121,18 @@ def check(repo, uses=None):
         rows, carried = workflow_findings(name, text)
         found += rows
         stepped |= carried
+        targets, complaints = make_workflow_targets(text)
+        make_targets |= targets
+        found += [(f"Make checks ({name})", complaint) for complaint in complaints]
         if uses is not None:
             for action, version in actions_used(text):
                 uses.setdefault(action, {}).setdefault(version, []).append(repo)
 
-    found += absent_step_findings(holds, repo, stepped)
+    container_stepped = set()
+    if make_targets:
+        rows, container_stepped = make_findings(make_targets, repo)
+        found += rows
+    found += absent_step_findings(holds, repo, stepped, container_stepped, bool(make_targets))
 
     return found
 
