@@ -138,17 +138,17 @@ workflow runs it on Mondays at 07:00 UTC, and on a push to `main` touching
 
 ## Developing
 
-Checks require Make and Docker 29.9.3, matching CI. The container uses the
-declared Python runtime and pinned tooling; only a source snapshot and scratch storage
-are mounted.
+The [container check contract](./docs/container-checks.md) defines command direction,
+isolation, image identity and ownership. Native commands run directly on the host;
+CI uses native commands in a suitable prebuilt image, or Make when a custom image
+is required.
+
+Checks require Make and Docker 29.9.3, matching CI. Only a sanitized source snapshot
+and scratch storage are mounted during verification.
 
 ```bash
 make check
-make test TEST_ARGS='-k TestCheck'
-make lint
-make build
-make check-info
 ```
 
-`make check` runs lint, the unit suite and archive packaging. `make build` exports
-its archive under `dist/`; the full gate leaves build artifacts in scratch.
+The full gate runs lint, the unit suite and archive packaging. Its artifacts remain
+in scratch. Additional Make targets are project-owned.
