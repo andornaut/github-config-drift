@@ -188,3 +188,29 @@ stock_finish
         tmp_path,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_snapshot_preserves_only_tracked_gitlink_directories(tmp_path):
+    result = shell(
+        """source "$1"
+checkout=$2/checkout
+scratch=$2/scratch
+mkdir -p "$checkout/ergogen/kb_ergogen_helper" "$checkout/v1/ergogen"
+mkdir -p "$checkout/untracked-empty" "$checkout/ordinary" "$scratch"
+git_metadata=(git --no-optional-locks -c core.fsmonitor=false -c core.hooksPath=/dev/null)
+git -C "$checkout" init --quiet
+object=1111111111111111111111111111111111111111
+git -C "$checkout" update-index --add --cacheinfo "160000,$object,ergogen/kb_ergogen_helper"
+git -C "$checkout" update-index --add --cacheinfo "100644,$object,ordinary"
+ln -s ../../ergogen/kb_ergogen_helper/ "$checkout/v1/ergogen/kb_ergogen_helper"
+git -C "$checkout" add v1/ergogen/kb_ergogen_helper
+snapshot "$scratch/source.tar"
+stock_validate_source "$scratch/source.tar"
+tar --list --file "$scratch/source.tar"
+""",
+        tmp_path,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "ergogen/kb_ergogen_helper/" in result.stdout.splitlines()
+    assert "ordinary/" not in result.stdout.splitlines()
+    assert "untracked-empty/" not in result.stdout.splitlines()
