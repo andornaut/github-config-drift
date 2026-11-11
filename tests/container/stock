@@ -53,8 +53,11 @@ stock_copy_source() {
             cp --no-dereference --no-preserve=ownership -T -- "${source}" "${target}" || return
         elif [[ -d ${source} ]]; then
             mkdir -- "${target}" || return
-        else
+        elif [[ -f ${source} ]]; then
             cp --no-dereference --preserve=mode,timestamps --no-preserve=ownership -T -- "${source}" "${target}" || return
+        else
+            printf 'Source input is not a regular file, directory or symlink: %s\n' "${path}" >&2
+            return 2
         fi
     done < "${scratch}/source.list"
     while IFS= read -r -d '' target; do

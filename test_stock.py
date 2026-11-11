@@ -289,3 +289,15 @@ def test_tracked_path_through_external_parent_is_not_copied(project):
     result = shell(None, 'stock_begin "$2"', project)
     assert result.returncode != 0
     assert "Source path escapes checkout" in result.stderr
+
+
+def test_special_source_file_is_rejected_before_copy_can_block(project):
+    (project / "visible").unlink()
+    os.mkfifo(project / "visible")
+    result = shell(
+        None,
+        '''timeout --signal=TERM --kill-after=1 1 /bin/bash -eu -c 'source "$1"; stock_begin "$2"' bash "$1" "$2"''',
+        project,
+    )
+    assert result.returncode == 2, result.stderr
+    assert "not a regular file" in result.stderr
