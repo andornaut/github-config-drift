@@ -1108,6 +1108,10 @@ def native_node_steps(commands, files, *, gate=None):
         lint_names = {"lint", "check", "check:types"}
         if gate == "lint" or name.removeprefix("internal:") in lint_names:
             gate = "lint"
+        if gate == "lint" and arguments:
+            raise ValueError("Node lint arguments must not override the inspected command")
+        if arguments:
+            opaque = True
         if any(word.partition("=")[0] in information_options for word in arguments):
             raise ValueError("Node test and build tasks must execute checks, not informational probes")
         if name.removeprefix("internal:") in {"check", "check:types"} and text != (
@@ -1187,15 +1191,20 @@ def native_node_steps(commands, files, *, gate=None):
             return
         if words[:4] == ["shellcheck", "-x", "-P", "SCRIPTDIR"]:
             paths = words[4:]
+            terminated = False
         elif words[:2] == ["shellcheck", "--"]:
             paths = words[2:]
+            terminated = True
         elif words[:3] == ["shellcheck", "--shell=sh", "--"]:
             paths = words[3:]
+            terminated = True
         else:
             raise ValueError("Node ShellCheck must use direct, literal inputs")
         if not paths:
             raise ValueError("Node ShellCheck must name source inputs")
         for path in paths:
+            if path == "-" or (not terminated and path.startswith("-")):
+                raise ValueError("Node ShellCheck options cannot stand in for source inputs")
             if (
                 not re.fullmatch(r"[A-Za-z0-9_./-]+", path)
                 or path.startswith("/")
@@ -1211,7 +1220,7 @@ def native_node_steps(commands, files, *, gate=None):
         if words[:2] == ["npm", "run"] and len(words) >= 3:
             if words[3:] and (words[3] != "--" or any(not re.fullmatch(r"[-A-Za-z0-9_./=:]+", w) for w in words[4:])):
                 raise ValueError("Node task arguments must be literal")
-            if words[2].removeprefix("internal:") in {"lint", "check", "check:types"} and words[3:]:
+            if (gate == "lint" or words[2].removeprefix("internal:") in {"lint", "check", "check:types"}) and words[3:]:
                 raise ValueError("Node lint arguments must not override the inspected command")
             script_steps(words[2], gate=gate, arguments=words[4:] if words[3:] else ())
         elif words[:1] == ["shellcheck"]:

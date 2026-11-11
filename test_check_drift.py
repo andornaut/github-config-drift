@@ -3284,3 +3284,53 @@ class TestNativeNodeProfiles:
             )
             == set()
         )
+
+    @pytest.mark.parametrize(
+        ("tool", "arguments"),
+        [
+            ("markdownlint-cli2", ("--", "--disable", "MD013")),
+            ("markdownlint-cli2", ("--", "--config", "other.yml")),
+            ("shellcheck -x -P SCRIPTDIR tests/container/run tests/container/check", ("--", "--exclude=SC2086")),
+        ],
+    )
+    def test_explicit_lint_role_rejects_forwarded_overrides_on_arbitrary_aliases(self, tool, arguments):
+        files = self.files()
+        manifest = json.loads(files["package.json"])
+        manifest["scripts"]["verify"] = tool
+        files["package.json"] = json.dumps(manifest)
+        with pytest.raises(ValueError, match="lint arguments"):
+            cd.native_node_steps([("npm", "run", "verify", *arguments)], files, gate="lint")
+
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            ("--", "--config", "other.yml"),
+            ("--", "--", "--config", "other.yml"),
+        ],
+    )
+    def test_generic_forwarding_cannot_regain_credit_through_nested_lint_aliases(self, arguments):
+        files = self.files()
+        manifest = json.loads(files["package.json"])
+        manifest["scripts"]["verify"] = "npm run lint"
+        files["package.json"] = json.dumps(manifest)
+        assert cd.native_node_steps([("npm", "run", "verify", *arguments)], files) == set()
+
+    def test_shellcheck_flags_cannot_be_mistaken_for_regular_source_operands(self):
+        files = self.files()
+        files["--version"] = "#!/bin/sh\nexit 0\n"
+        with pytest.raises(ValueError, match="ShellCheck options"):
+            cd.native_node_steps([("shellcheck", "-x", "-P", "SCRIPTDIR", "--version")], files)
+        assert cd.native_node_steps([("shellcheck", "--", "--version")], files) == {"action-shellcheck"}
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            ("shellcheck", "-x", "-P", "SCRIPTDIR", "-"),
+            ("shellcheck", "--", "-"),
+        ],
+    )
+    def test_shellcheck_stdin_is_not_an_immutable_source_file(self, command):
+        files = self.files()
+        files["-"] = "#!/bin/sh\nexit 0\n"
+        with pytest.raises(ValueError, match="ShellCheck options"):
+            cd.native_node_steps([command], files)
