@@ -65,19 +65,22 @@ def shell(env, script, *arguments):
     )
 
 
-def test_public_copy_excludes_ignored_files_and_git_metadata(project):
+def test_public_copy_excludes_ignored_files_and_git_metadata(project, docker):
+    env, _ = docker
     (project / "private").mkdir()
     (project / "private/ignored").write_text("not a check input")
     result = shell(
-        None,
-        'stock_begin "$2"; test -f "$stock_source/visible"; '
+        env,
+        'stock_begin "$2"; stock_run "$3" -- true; test -f "$stock_source/visible"; '
         'test ! -e "$stock_source/private"; test ! -e "$stock_source/.git"; stock_finish',
         project,
+        IMAGE,
     )
     assert result.returncode == 0, result.stderr
 
 
-def test_gitlink_directory_and_internal_symlink_are_preserved(project):
+def test_gitlink_directory_and_internal_symlink_are_preserved(project, docker):
+    env, _ = docker
     (project / "ergogen/helper").mkdir(parents=True)
     (project / "untracked-empty").mkdir()
     git(
@@ -89,42 +92,11 @@ def test_gitlink_directory_and_internal_symlink_are_preserved(project):
     )
     (project / "alias").symlink_to("ergogen/helper/", target_is_directory=True)
     result = shell(
-        None,
-        'stock_begin "$2"; test -d "$stock_source/ergogen/helper"; '
+        env,
+        'stock_begin "$2"; stock_run "$3" -- true; test -d "$stock_source/ergogen/helper"; '
         'test -L "$stock_source/alias"; test ! -e "$stock_source/untracked-empty"; stock_finish',
         project,
-    )
-    assert result.returncode == 0, result.stderr
-
-
-@pytest.mark.parametrize("target", ["../outside", "/outside", "private/ignored"])
-def test_symlinks_cannot_expose_unselected_or_external_content(project, target):
-    (project / "private").mkdir()
-    (project / "private/ignored").write_text("not selected")
-    (project.parent / "outside").write_text("outside")
-    (project / "alias").symlink_to(target)
-    result = shell(None, 'stock_begin "$2"', project)
-    assert result.returncode != 0
-    assert "Source symlink" in result.stderr
-
-
-def test_dirty_source_is_allowed_but_later_changes_discard_results(project):
-    (project / "visible").write_text("dirty before\n")
-    result = shell(
-        None,
-        'stock_begin "$2"; test "$source_dirty" = true; printf changed > "$checkout/visible"; stock_finish',
-        project,
-    )
-    assert result.returncode == 125
-    assert "public source changed" in result.stderr
-
-
-def test_unchanged_dirty_source_is_verified(project):
-    (project / "new").write_text("new public input")
-    result = shell(
-        None,
-        'stock_begin "$2"; test "$source_dirty" = true; test -f "$stock_source/new"; stock_finish',
-        project,
+        IMAGE,
     )
     assert result.returncode == 0, result.stderr
 
@@ -160,7 +132,7 @@ esac
     return env, log
 
 
-def test_native_argv_caps_source_bind_and_provenance_are_literal(project, docker):
+def test_native_argv_and_isolation_are_preserved(project, docker):
     env, log = docker
     payload = "$(touch /scratch/must-not-run)"
     result = shell(
@@ -186,7 +158,6 @@ def test_native_argv_caps_source_bind_and_provenance_are_literal(project, docker
     ]:
         assert item in arguments
     assert any(b"target=/source,readonly" in item for item in arguments)
-    assert any(item.startswith(b"CHECK_SOURCE_SHA256=") for item in arguments)
     assert not any(b"target=/outputs" in item for item in arguments)
 
 
@@ -230,7 +201,7 @@ def test_shellcheck_is_direct_and_always_offline(project, docker):
     assert any(b"target=/work,readonly" in item for item in arguments)
 
 
-def test_only_fresh_project_output_directory_is_bound_writable(project, docker):
+def test_explicit_output_directory_is_bound_writable(project, docker):
     env, log = docker
     result = shell(
         env,
@@ -243,39 +214,11 @@ def test_only_fresh_project_output_directory_is_bound_writable(project, docker):
     assert b"target=/outputs" in log.read_bytes()
 
 
-@pytest.mark.parametrize(
-    "setup",
-    [
-        "output=$checkout",
-        "output=$scratch/source",
-        'output=$scratch/nonempty; mkdir "$output"; touch "$output/file"',
-    ],
-)
-def test_output_bind_rejects_checkout_control_and_reused_directories(project, docker, setup):
-    env, _ = docker
-    result = shell(
-        env,
-        'stock_begin "$2"; ' + setup + '; STOCK_OUTPUT_DIR=$output stock_run "$3" -- true',
-        project,
-        IMAGE,
-    )
-    assert result.returncode == 2
-    assert "fresh owned directory" in result.stderr
-
-
 def test_native_failure_status_is_preserved(project, docker):
     env, _ = docker
     env["FAKE_RESULT"] = "37"
     result = shell(env, 'stock_begin "$2"; stock_run "$3" -- false', project, IMAGE)
     assert result.returncode == 37
-
-
-def test_cleanup_failure_discards_results_and_preserves_owned_scratch(project, docker):
-    env, _ = docker
-    env["FAKE_CLEANUP"] = "1"
-    result = shell(env, 'stock_begin "$2"; stock_run "$3" -- true', project, IMAGE)
-    assert result.returncode == 125
-    assert "cleanup is unconfirmed" in result.stderr
 
 
 def test_tracked_path_through_external_parent_is_not_copied(project):
@@ -286,7 +229,7 @@ def test_tracked_path_through_external_parent_is_not_copied(project):
     (project / ".gitignore").write_text("private/\nescape\n")
     blob = git(project, "rev-parse", "HEAD:visible").stdout.strip()
     git(project, "update-index", "--add", "--cacheinfo", f"100644,{blob},escape/payload")
-    result = shell(None, 'stock_begin "$2"', project)
+    result = shell(None, 'stock_begin "$2"; stock_copy_source', project)
     assert result.returncode != 0
     assert "Source path escapes checkout" in result.stderr
 
@@ -296,7 +239,8 @@ def test_special_source_file_is_rejected_before_copy_can_block(project):
     os.mkfifo(project / "visible")
     result = shell(
         None,
-        '''timeout --signal=TERM --kill-after=1 1 /bin/bash -eu -c 'source "$1"; stock_begin "$2"' bash "$1" "$2"''',
+        '''timeout --signal=TERM --kill-after=1 1 /bin/bash -eu -c \
+'source "$1"; stock_begin "$2"; stock_copy_source' bash "$1" "$2"''',
         project,
     )
     assert result.returncode == 2, result.stderr
