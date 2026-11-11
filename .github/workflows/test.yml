@@ -50,14 +50,20 @@ jobs:
         with:
           version: v29.9.3
 
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@v4.4.1
-        with:
-          version: v0.38.2
-          driver: docker
-
       - name: Run test
-        run: make test
+        shell: bash
+        run: |
+          set -euo pipefail
+          source tests/container/stock
+          stock_begin "$PWD"
+          stock_image python_image "python:$(cat .python-version)"
+          stock_prepare "${python_image}" python -- sh -ec '
+            python -m venv /scratch/venv >&2
+            /scratch/venv/bin/python -m pip install --disable-pip-version-check -r requirements-dev.txt >&2
+            tar --create --file - --directory / scratch/venv
+          '
+          stock_run "${python_image}" python -- /scratch/venv/bin/python -m pytest -v -p no:cacheprovider --basetemp=/scratch/pytest
+          stock_finish
 
   lint:
     name: Lint
@@ -75,11 +81,33 @@ jobs:
         with:
           version: v29.9.3
 
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@v4.4.1
-        with:
-          version: v0.38.2
-          driver: docker
-
       - name: Run lint
-        run: make lint
+        shell: bash
+        run: |
+          set -euo pipefail
+          source tests/container/stock
+          stock_begin "$PWD"
+          stock_image python_image "python:$(cat .python-version)"
+          stock_prepare "${python_image}" python -- sh -ec '
+            python -m venv /scratch/venv >&2
+            /scratch/venv/bin/python -m pip install --disable-pip-version-check -r requirements-dev.txt >&2
+            tar --create --file - --directory / scratch/venv
+          '
+          stock_run "${python_image}" python -- sh -ec '
+            bash -n configs/container/run tests/container/stock tests/container/check-stock
+            sh -n tests/container/python tests/container/markdown
+            /scratch/venv/bin/ruff check .
+            /scratch/venv/bin/ruff format --check .
+          '
+          stock_image markdown_image node:24.22.2
+          stock_prepare "${markdown_image}" markdown -- sh -ec '
+            mkdir -p /scratch/markdown
+            cp tests/container/package.json tests/container/package-lock.json /scratch/markdown/
+            npm ci --prefix /scratch/markdown --ignore-scripts --no-audit --no-fund --maxsockets=1 >&2
+            tar --create --file - --directory / scratch/markdown
+          '
+          stock_run "${markdown_image}" markdown -- /scratch/markdown/node_modules/.bin/markdownlint-cli2
+          stock_image shellcheck_image koalaman/shellcheck:v0.11.0
+          stock_readonly "${shellcheck_image}" /bin/shellcheck -x -P SCRIPTDIR \
+            configs/container/run tests/container/stock tests/container/check-stock tests/container/python tests/container/markdown
+          stock_finish
