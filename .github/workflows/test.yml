@@ -56,6 +56,8 @@ jobs:
           set -euo pipefail
           source tests/container/stock
           stock_begin "$PWD"
+          [[ ${revision} == "${GITHUB_SHA:?}" ]]
+          [[ ${source_dirty} == false ]]
           stock_image python_image "python:$(cat .python-version)"
           stock_prepare "${python_image}" python -- sh -ec '
             python -m venv /scratch/venv >&2
@@ -87,6 +89,8 @@ jobs:
           set -euo pipefail
           source tests/container/stock
           stock_begin "$PWD"
+          [[ ${revision} == "${GITHUB_SHA:?}" ]]
+          [[ ${source_dirty} == false ]]
           stock_image python_image "python:$(cat .python-version)"
           stock_prepare "${python_image}" python -- sh -ec '
             python -m venv /scratch/venv >&2
@@ -94,8 +98,12 @@ jobs:
             tar --create --file - --directory / scratch/venv
           '
           stock_run "${python_image}" python -- sh -ec '
-            bash -n configs/container/run tests/container/stock tests/container/check-stock
-            sh -n tests/container/python tests/container/markdown
+            for script in configs/container/run tests/container/stock tests/container/check-stock; do
+              bash -n "$script"
+            done
+            for script in tests/container/python tests/container/markdown; do
+              sh -n "$script"
+            done
             /scratch/venv/bin/ruff check .
             /scratch/venv/bin/ruff format --check .
           '
