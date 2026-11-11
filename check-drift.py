@@ -1075,7 +1075,7 @@ def helper_profile(text):
     raise ValueError("container task helper differs from the inspected dispatch profiles")
 
 
-def native_node_steps(commands, files):
+def native_node_steps(commands, files, *, gate=None):
     """Inspect literal native npm scripts without following Make or container dispatch."""
     manifest = json.loads(files["package.json"])
     lock = json.loads(files["package-lock.json"])
@@ -1083,6 +1083,7 @@ def native_node_steps(commands, files):
         raise TypeError("Node lint manifests must declare their native scripts")
     scripts = manifest["scripts"]
     carried = set()
+    opaque = False
     information_options = {
         "--version",
         "--help",
@@ -1096,6 +1097,7 @@ def native_node_steps(commands, files):
     }
 
     def script_steps(name, stack=(), gate=None, arguments=()):
+        nonlocal opaque
         if (
             name in stack
             or not isinstance(scripts.get(name), str)
@@ -1136,9 +1138,10 @@ def native_node_steps(commands, files):
                     or packages["node_modules/markdownlint-cli2"].get("version") != version
                 ):
                     raise ValueError(f"Node lint must install locked markdownlint-cli2 {version}")
-                carried.add("markdownlint-cli2-action")
+                if gate == "lint":
+                    carried.add("markdownlint-cli2-action")
             elif words[:1] == ["shellcheck"]:
-                shell_steps(words)
+                shell_steps(words, credit=gate == "lint")
             elif command in {"prettier --check .", "eslint --max-warnings 0 ."}:
                 pass
             elif gate == "lint":
@@ -1155,7 +1158,7 @@ def native_node_steps(commands, files):
                 "wrangler deploy --config wrangler.jsonc --no-bundle --dry-run",
                 "cf deploy --prebuilt --mode production --dry-run",
             } or (command == "rm -rf web-ext-artifacts/*" and name == "package"):
-                pass
+                opaque = True
             elif (
                 not words
                 or words[0]
@@ -1176,8 +1179,10 @@ def native_node_steps(commands, files):
                 )
             ):
                 raise ValueError(f"Node {name} must invoke a native test or build tool")
+            else:
+                opaque = True
 
-    def shell_steps(words):
+    def shell_steps(words, *, credit=True):
         if words == ["shellcheck", "--version"]:
             return
         if words[:4] == ["shellcheck", "-x", "-P", "SCRIPTDIR"]:
@@ -1198,7 +1203,8 @@ def native_node_steps(commands, files):
                 or not files.get(path)
             ):
                 raise ValueError(f"missing ShellCheck input {path}")
-        carried.add("action-shellcheck")
+        if credit:
+            carried.add("action-shellcheck")
 
     for command in commands:
         words = list(command)
@@ -1207,12 +1213,12 @@ def native_node_steps(commands, files):
                 raise ValueError("Node task arguments must be literal")
             if words[2].removeprefix("internal:") in {"lint", "check", "check:types"} and words[3:]:
                 raise ValueError("Node lint arguments must not override the inspected command")
-            script_steps(words[2], arguments=words[4:] if words[3:] else ())
+            script_steps(words[2], gate=gate, arguments=words[4:] if words[3:] else ())
         elif words[:1] == ["shellcheck"]:
             shell_steps(words)
         else:
             raise ValueError("Node tasks must invoke native npm scripts or direct ShellCheck")
-    return carried
+    return set() if opaque or gate in {"test", "build"} else carried
 
 
 def node_container_steps(commands, files):
@@ -1235,14 +1241,14 @@ def node_container_steps(commands, files):
     shell = "shellcheck -x -P SCRIPTDIR tests/container/run tests/container/check"
     if not commands or commands[0] != shell:
         raise ValueError("Node lint must run direct ShellCheck and native npm commands")
-    carried = native_node_steps([tuple(command.split()) for command in commands], files)
+    carried = native_node_steps([tuple(command.split()) for command in commands], files, gate="lint")
     helper = files["tests/container/check"]
     if "\nrun_task() {\n" in helper:
         for match in re.finditer(r"^    (test|build)\)\n(.*?)^        ;;$", helper, re.MULTILINE | re.DOTALL):
             commands = [tuple(line.split()) for line in match[2].splitlines() if line.strip()]
             # The fixed check dispatcher invokes each task without arguments.
             commands = [command[:-1] if command[-1:] == ('"$@"',) else command for command in commands]
-            native_node_steps(commands, files)
+            native_node_steps(commands, files, gate=match[1])
     return carried
 
 

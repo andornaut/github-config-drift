@@ -3234,3 +3234,53 @@ class TestNativeNodeProfiles:
     def test_shellcheck_source_proof_rejects_empty_missing_and_masked_input_profiles(self, command):
         with pytest.raises(ValueError, match="ShellCheck"):
             cd.native_node_steps([command], self.files())
+
+    @pytest.mark.parametrize("leaf", ["node scripts/mask-tools.js", "jest", "vite build"])
+    def test_helper_lint_seeds_its_role_before_following_an_arbitrary_alias(self, leaf):
+        files = self.files()
+        files["tests/container/check"] = files["tests/container/check"].replace("npm run lint", "npm run verify")
+        manifest = json.loads(files["package.json"])
+        manifest["scripts"]["verify"] = leaf + " && markdownlint-cli2"
+        files["package.json"] = json.dumps(manifest)
+        _, commands = cd.helper_profile(files["tests/container/check"])
+        with pytest.raises(ValueError, match="unmasked lint commands"):
+            cd.node_container_steps(commands, files)
+
+    def test_explicit_lint_role_can_follow_an_alias_to_actual_lint_tools(self):
+        files = self.files()
+        manifest = json.loads(files["package.json"])
+        manifest["scripts"]["verify"] = "markdownlint-cli2"
+        files["package.json"] = json.dumps(manifest)
+        assert cd.native_node_steps([("npm", "run", "verify")], files, gate="lint") == {"markdownlint-cli2-action"}
+        assert cd.native_node_steps([("npm", "run", "verify")], files) == set()
+
+    @pytest.mark.parametrize("root", ["test", "build", "verify"])
+    @pytest.mark.parametrize("order", ["before", "after"])
+    def test_generic_native_shapes_do_not_prove_lint_after_opaque_code(self, root, order):
+        files = self.files()
+        manifest = json.loads(files["package.json"])
+        opaque = "node scripts/mask-tools.js"
+        chain = [opaque, "npm run lint"] if order == "before" else ["npm run lint", opaque]
+        manifest["scripts"][root] = " && ".join(chain)
+        files["package.json"] = json.dumps(manifest)
+        assert cd.native_node_steps([("npm", "run", root)], files) == set()
+
+    @pytest.mark.parametrize("gate", ["test", "build"])
+    def test_non_lint_helper_roles_do_not_grant_lint_coverage(self, gate):
+        assert cd.native_node_steps([("npm", "run", "lint")], self.files(), gate=gate) == set()
+
+    def test_opaque_generic_commands_do_not_grant_later_shellcheck_credit(self):
+        files = self.files()
+        manifest = json.loads(files["package.json"])
+        manifest["scripts"]["build"] = "node scripts/mask-tools.js"
+        files["package.json"] = json.dumps(manifest)
+        assert (
+            cd.native_node_steps(
+                [
+                    ("npm", "run", "build"),
+                    ("shellcheck", "--", "tests/container/check"),
+                ],
+                files,
+            )
+            == set()
+        )
