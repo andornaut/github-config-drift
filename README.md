@@ -135,13 +135,13 @@ workflow runs it on Mondays at 07:00 UTC, and on a push to `main` touching
 ## Developing
 
 The [container check contract](./docs/container-checks.md) defines command direction,
-isolation, image identity and ownership. Native commands run directly on the host;
+isolation, image choice and ownership. Native commands run directly on the host;
 CI uses native commands in a suitable prebuilt image, or Make when a custom image
 is required.
 
 Checks require Make, Bash, Git, GNU coreutils/findutils and Docker 29.9.3. Checks run
-in pinned stock images. A filtered public source view is mounted read-only; each
-language installs dependencies and runs its checks in one isolated container.
+in pinned stock images with a read-only public source view. Each frozen dependency
+graph is installed once for its checks.
 
 ```bash
 make check

@@ -1,2 +1,0 @@
-- name: Run lint
-  run: make lint

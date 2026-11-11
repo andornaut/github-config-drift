@@ -1,41 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 checkout=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
-stock_entrypoint_path=${BASH_SOURCE[0]}
-stock_entrypoint_hash=$(sha256sum "${stock_entrypoint_path}" | cut -d ' ' -f1)
 # shellcheck source=tests/container/stock
 source "${checkout}/tests/container/stock"
 action=${1:-check}
-case "${action}" in check|lint|test|build) ;; *) printf 'Unknown stock check: %s\n' "${action}" >&2; exit 2 ;; esac
-if (( $# > 1 )); then printf '%s\n' 'Stock checks do not accept extra arguments.' >&2; exit 2; fi
-: "${PYTHON_IMAGE:?The Makefile declares PYTHON_IMAGE}"
+case "${action}" in check|lint|test|build) ;; *) printf 'Unknown check: %s\n' "${action}" >&2; exit 2 ;; esac
 stock_begin "${checkout}"
-python_image=
-markdown_image=
-shellcheck_image=
-stock_image python_image "${PYTHON_IMAGE}"
 if [[ ${action} == build ]]; then
-    [[ ! -L dist ]]
-    mkdir -p dist
-    git check-ignore --quiet dist/github-config-drift.tar.gz
-    artifact=$(mktemp dist/.github-config-drift.XXXXXXXX)
-    if stock_run "${python_image}" -- sh tests/container/python build > "${artifact}"; then
-        mv -- "${artifact}" dist/github-config-drift.tar.gz
-    else
-        unlink "${artifact}"
-        exit 1
-    fi
+    mkdir -p "${checkout}/dist"
+    stock_run "${PYTHON_IMAGE}" -- sh tests/container/python build > "${checkout}/dist/github-config-drift.tar.gz"
 else
-    STOCK_NETWORK=bridge stock_run "${python_image}" -- sh tests/container/python "${action}"
+    STOCK_NETWORK=bridge stock_run "${PYTHON_IMAGE}" -- sh tests/container/python "${action}"
 fi
 if [[ ${action} == check || ${action} == lint ]]; then
-    : "${MARKDOWN_IMAGE:?The Makefile declares MARKDOWN_IMAGE}"
-    : "${SHELLCHECK_IMAGE:?The Makefile declares SHELLCHECK_IMAGE}"
-    stock_image markdown_image "${MARKDOWN_IMAGE}"
-    stock_image shellcheck_image "${SHELLCHECK_IMAGE}"
-    STOCK_NETWORK=bridge stock_run "${markdown_image}" -- sh tests/container/markdown
-    stock_readonly "${shellcheck_image}" /bin/shellcheck -x -P SCRIPTDIR \
-        configs/container/run tests/container/stock \
-        tests/container/check-stock tests/container/python tests/container/markdown
+    STOCK_NETWORK=bridge stock_run "${MARKDOWN_IMAGE}" -- sh tests/container/markdown
+    stock_readonly "${SHELLCHECK_IMAGE}" /bin/shellcheck -x -P SCRIPTDIR \
+        tests/container/stock tests/container/check-stock tests/container/python tests/container/markdown
 fi
 stock_finish

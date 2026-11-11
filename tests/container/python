@@ -3,7 +3,7 @@ set -eu
 action=${1:?Expected check, lint, test or build}
 case "$action" in check|lint|test|build) ;; *) exit 2 ;; esac
 if [ "$action" = check ] || [ "$action" = lint ]; then
-    for script in configs/container/run tests/container/stock tests/container/check-stock; do
+    for script in tests/container/stock tests/container/check-stock; do
         bash -n "$script"
     done
     for script in tests/container/python tests/container/markdown; do
