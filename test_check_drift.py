@@ -3682,7 +3682,7 @@ jobs:
             "markdownlint-cli2",
             "/bin/shellcheck -x -P SCRIPTDIR",
             "py_compile check-drift.py test_check_drift.py",
-            "tar --create --gzip --file dist/github-config-drift.tar.gz check-drift.py configs",
+            "tar --create --gzip --file - check-drift.py configs",
         ):
             assert command in body
         assert "docker build" not in body

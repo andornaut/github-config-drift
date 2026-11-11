@@ -35,8 +35,9 @@ rather than adding a custom image build. A project needing a custom image owns i
 Dockerfile, explicit context manifest, build arguments and runtime version inputs.
 Execute the image ID returned by its builder; do not add an independent CI image
 pin or require a registry. The stock launcher resolves cached or pulled image
-references to immutable IDs. Frozen dependency archives are restored only with
-the same image ID; networked preparation is separate from offline checks.
+references to immutable IDs. Each language installs its frozen dependencies and
+runs all requested checks in one container. Dependency installation may explicitly
+enable bridge networking; other invocations default to no network.
 
 Custom-image CI may use optional category aliases to preserve separate jobs and
 status-check names. A private launcher, command
@@ -47,21 +48,23 @@ commands; stock CI does not dispatch project phases or Make.
 
 ## Isolation, outputs and resources
 
-Custom image launchers restrict build context to declared regular files. Source
-archives use containment and exclusion checks. Git metadata and credential-shaped
-paths are excluded. Source status, revision and file/archive fingerprints must stay
-unchanged throughout verification; discard results if they change. The stock
-library validates archive headers and logical sizes before host extraction.
+Custom images copy the selected public source through their Dockerfile and run
+through Make. Stock checks copy a filtered public source view into owned scratch,
+bind it read-only at `/source`, and use a writable container copy at `/work`.
+Git metadata and credential-shaped paths are excluded. Source status, revision
+and file fingerprints must stay unchanged throughout verification; discard
+results if they change.
 
 Only explicitly declared generated paths may be exported by a project interface.
-Outputs must be ignored content inside the checkout, without tracked
-source, symlinks or special files. Validate existing and replacement trees, replace
-rather than merge generated destinations, and preserve prior output if replacement
-cannot complete safely. The aggregate `make check` exports nothing.
+Outputs must be ignored content inside the checkout, without tracked source,
+symlinks or special files. Projects own their native artifact copy and atomic
+publication checks. A product archive may be captured from stdout; multiple
+outputs may use an explicit writable scratch binding. The aggregate `make check`
+exports nothing.
 
 The canonical launcher caps custom image builds and execution at four CPUs, with
 4 GiB memory by default and `nofile=256:256`. A validated `CHECK_MEMORY` setting applies
-to both phases. Source snapshots run at `/work` as nonroot UID `19001`, with
+to both phases. Checks run at `/work` as nonroot UID `19001`, with
 temporary HOME and scratch storage. Execution uses a read-only root filesystem,
 dropped capabilities, no privilege escalation and bounded processes. Checks default
 to no network; reviewed project requirements may enable it.

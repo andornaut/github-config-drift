@@ -1,28 +1,31 @@
 #!/bin/sh
 set -eu
-case "$1" in
-    prepare)
-        python -m venv /scratch/venv >&2
-        /scratch/venv/bin/python -m pip install --disable-pip-version-check -r requirements-dev.txt >&2
-        exec tar --create --file - --directory / scratch/venv
-        ;;
-    lint)
-        for script in configs/container/run tests/container/stock tests/container/check-stock; do
-            bash -n "$script"
-        done
-        for script in tests/container/python tests/container/markdown; do
-            sh -n "$script"
-        done
-        /scratch/venv/bin/ruff check .
-        exec /scratch/venv/bin/ruff format --check .
-        ;;
-    test)
-        exec /scratch/venv/bin/python -m pytest -v -p no:cacheprovider --basetemp=/scratch/pytest
-        ;;
-    build)
-        python -m py_compile check-drift.py test_check_drift.py
-        mkdir -p dist
-        exec tar --create --gzip --file dist/github-config-drift.tar.gz check-drift.py configs
-        ;;
-    *) exit 2 ;;
-esac
+action=${1:?Expected check, lint, test or build}
+case "$action" in check|lint|test|build) ;; *) exit 2 ;; esac
+if [ "$action" = check ] || [ "$action" = lint ]; then
+    for script in configs/container/run tests/container/stock tests/container/check-stock; do
+        bash -n "$script"
+    done
+    for script in tests/container/python tests/container/markdown; do
+        sh -n "$script"
+    done
+fi
+if [ "$action" != build ]; then
+    python -m venv /scratch/venv >&2
+    /scratch/venv/bin/python -m pip install --disable-pip-version-check -r requirements-dev.txt >&2
+fi
+if [ "$action" = check ] || [ "$action" = lint ]; then
+    /scratch/venv/bin/ruff check .
+    /scratch/venv/bin/ruff format --check .
+fi
+if [ "$action" = check ] || [ "$action" = test ]; then
+    /scratch/venv/bin/python -m pytest -v -p no:cacheprovider --basetemp=/scratch/pytest
+fi
+if [ "$action" = check ] || [ "$action" = build ]; then
+    python -m py_compile check-drift.py test_check_drift.py
+    if [ "$action" = build ]; then
+        exec tar --create --gzip --file - check-drift.py configs
+    fi
+    mkdir -p dist
+    tar --create --gzip --file dist/github-config-drift.tar.gz check-drift.py configs
+fi
