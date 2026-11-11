@@ -233,8 +233,8 @@ def test_python_controller_cannot_import_an_added_stdlib_shadow(monkeypatch):
             else catalog["blobs"][record["sha256"]]
         )
         modes[name] = "100755" if "canonical" in record else record["mode"]
-    files["scripts/json.py"] = "raise SystemExit(0)\n"
-    modes["scripts/json.py"] = "100644"
+    files["scripts/hashlib.py"] = "raise SystemExit(0)\n"
+    modes["scripts/hashlib.py"] = "100644"
     _SourceFixture.install(monkeypatch, files, modes)
     with pytest.raises(ValueError, match="forbidden dependency"):
         cd.closed_stock_source(repo)
