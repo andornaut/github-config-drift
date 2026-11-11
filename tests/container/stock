@@ -87,7 +87,10 @@ stock_begin() {
         printf '%s\n' 'Source changed while capturing the stock snapshot.' >&2
         return 125
     fi
-    before=$(printf '%s\n%s\n%s\n' "${initial_status}" "${revision}" "${source_hash}")
+    before=$(
+        if [[ -n ${initial_status} ]]; then printf '%s\n' "${initial_status}"; fi
+        printf '%s\n%s\n' "${revision}" "${source_hash}"
+    )
 }
 
 stock_image() {

@@ -166,3 +166,25 @@ stock_begin "$fixture"
     )
     assert result.returncode == 125
     assert "Source changed while capturing" in result.stderr
+
+
+def test_clean_source_verification_accepts_unchanged_snapshot(tmp_path):
+    result = shell(
+        """source "$1"
+fixture=$2
+git() {
+  case "$*" in
+    *container-exec-active*) printf '%s/marker\n' "$fixture" ;;
+    *'rev-parse HEAD') printf 'revision\n' ;;
+    *'--format=%ct'*) printf '1\n' ;;
+    *'status --porcelain'*) : ;;
+  esac
+}
+snapshot() { printf source > "$1"; }
+stock_validate_source() { :; }
+stock_begin "$fixture"
+stock_finish
+""",
+        tmp_path,
+    )
+    assert result.returncode == 0, result.stderr
