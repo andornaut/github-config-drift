@@ -815,7 +815,20 @@ def native_steps(repo, workflows):
         return found
 
     carried = declared()
-    if len(carried) == 2 or not re.search(r"tests/container/|\bstock_|\bmake\s+(?:check|lint)(?:\s|$)", text):
+    if len(carried) == 2:
+        return carried
+    scripts = re.findall(r"\bnpm\s+run\s+([\w:-]+)", text)
+    if scripts:
+        content = fetch(repo, "package.json")
+        if content is not None:
+            manifest = json.loads(decode(content))
+            for name in scripts:
+                command = (manifest.get("scripts") or {}).get(name)
+                if isinstance(command, str):
+                    text += "\n" + command
+            carried = declared()
+    container_route = r"tests/container/|\bstock_|\bmake\s+(?:(?:check|lint)(?:\s|$)|\$\{\{\s*matrix\.)"
+    if len(carried) == 2 or not re.search(container_route, text):
         return carried
     for path in (
         "Makefile",

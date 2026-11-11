@@ -1423,3 +1423,30 @@ class TestNativeLintDeclarations:
             "action-shellcheck",
             "markdownlint-cli2-action",
         }
+
+    def test_matrix_make_targets_discover_the_configured_linter(self, monkeypatch):
+        def fetch(repo, path):
+            if path == "tests/container/Dockerfile":
+                return base64.b64encode(
+                    b"COPY --from=koalaman/shellcheck:v0.11.0 /bin/shellcheck /bin/shellcheck"
+                ).decode()
+            return None
+
+        monkeypatch.setattr(cd, "fetch", fetch)
+        workflow = TestWorkflowFindings.with_steps("      - run: make ${{ matrix.targets }}")
+        assert cd.native_steps("example", {"test.yml": workflow}) == {"action-shellcheck"}
+
+    def test_npm_lint_reads_the_called_script_without_crediting_unused_scripts(self, monkeypatch):
+        calls = []
+
+        def fetch(repo, path):
+            calls.append(path)
+            assert path == "package.json"
+            return base64.b64encode(
+                json.dumps({"scripts": {"lint": "shellcheck scripts/*.sh", "unused": "markdownlint-cli2"}}).encode()
+            ).decode()
+
+        monkeypatch.setattr(cd, "fetch", fetch)
+        workflow = TestWorkflowFindings.with_steps("      - run: npm run lint")
+        assert cd.native_steps("example", {"test.yml": workflow}) == {"action-shellcheck"}
+        assert calls == ["package.json"]
