@@ -1,0 +1,115 @@
+{
+  "python-sweep": {
+    "helpers": {
+      "tests/container/check-stock": "#!/usr/bin/env bash\nset -euo pipefail\ncheckout=$(CDPATH='' cd -- \"$(dirname -- \"$0\")/../..\" && pwd)\nstock_entrypoint_path=${BASH_SOURCE[0]}\nstock_entrypoint_hash=$(sha256sum \"${stock_entrypoint_path}\" | cut -d ' ' -f1)\n# shellcheck source=tests/container/stock\nsource \"${checkout}/tests/container/stock\"\naction=${1:-check}\ncase \"${action}\" in check|lint|test|build) ;; *) printf 'Unknown stock check: %s\\n' \"${action}\" >&2; exit 2 ;; esac\nif (( $# > 1 )); then printf '%s\\n' 'Stock checks do not accept extra arguments.' >&2; exit 2; fi\n: \"${PYTHON_IMAGE:?The Makefile declares PYTHON_IMAGE}\"\nstock_begin \"${checkout}\"\npython_image=\nmarkdown_image=\nshellcheck_image=\nstock_image python_image \"${PYTHON_IMAGE}\"\nif [[ ${action} != build ]]; then\n    stock_prepare \"${python_image}\" python -- sh tests/container/python prepare\nfi\nif [[ ${action} == check || ${action} == lint ]]; then\n    : \"${MARKDOWN_IMAGE:?The Makefile declares MARKDOWN_IMAGE}\"\n    : \"${SHELLCHECK_IMAGE:?The Makefile declares SHELLCHECK_IMAGE}\"\n    stock_image markdown_image \"${MARKDOWN_IMAGE}\"\n    stock_image shellcheck_image \"${SHELLCHECK_IMAGE}\"\n    stock_prepare \"${markdown_image}\" markdown -- sh tests/container/markdown prepare\n    stock_run \"${python_image}\" python -- sh tests/container/python lint\n    stock_run \"${markdown_image}\" markdown -- sh tests/container/markdown lint\n    stock_readonly \"${shellcheck_image}\" /bin/shellcheck -x -P SCRIPTDIR \\\n        configs/container/run tests/container/stock \\\n        tests/container/check-stock tests/container/python tests/container/markdown\nfi\nif [[ ${action} == check || ${action} == test ]]; then\n    stock_run \"${python_image}\" python -- sh tests/container/python test\nfi\nif [[ ${action} == check || ${action} == build ]]; then\n    if [[ ${action} == build ]]; then outputs=(dist); fi\n    stock_run \"${python_image}\" '' -- sh tests/container/python build\nfi\nstock_finish\n",
+      "tests/container/python": "#!/bin/sh\nset -eu\ncase \"$1\" in\n    prepare)\n        python -m venv /scratch/venv >&2\n        /scratch/venv/bin/python -m pip install --disable-pip-version-check -r requirements-dev.txt >&2\n        exec tar --create --file - --directory / scratch/venv\n        ;;\n    lint)\n        bash -n configs/container/run tests/container/stock tests/container/check-stock\n        sh -n tests/container/python tests/container/markdown\n        /scratch/venv/bin/ruff check .\n        exec /scratch/venv/bin/ruff format --check .\n        ;;\n    test)\n        exec /scratch/venv/bin/python -m pytest -v -p no:cacheprovider --basetemp=/scratch/pytest\n        ;;\n    build)\n        python -m py_compile check-drift.py test_check_drift.py\n        mkdir -p dist\n        exec tar --create --gzip --file dist/github-config-drift.tar.gz check-drift.py configs\n        ;;\n    *) exit 2 ;;\nesac\n",
+      "tests/container/markdown": "#!/bin/sh\nset -eu\ncase \"$1\" in\n    prepare)\n        mkdir -p /scratch/markdown\n        cp tests/container/package.json tests/container/package-lock.json /scratch/markdown/\n        npm ci --prefix /scratch/markdown --ignore-scripts --no-audit --no-fund --maxsockets=1 >&2\n        exec tar --create --file - --directory / scratch/markdown\n        ;;\n    lint)\n        exec /scratch/markdown/node_modules/.bin/markdownlint-cli2\n        ;;\n    *) exit 2 ;;\nesac\n"
+    },
+    "images": {
+      "PYTHON_IMAGE": "python:$(shell cat .python-version)",
+      "MARKDOWN_IMAGE": "node:24.22.2",
+      "SHELLCHECK_IMAGE": "koalaman/shellcheck:v0.11.0"
+    },
+    "version-file": ".python-version",
+    "requirements": "pytest==9.1.1\nruff==0.17.3\n# The sweep parses each repository's lint config to compare the shared part, and\n# reads the ShellCheck and markdownlint steps out of a workflow.\nPyYAML==6.0.3\n",
+    "markdown-dependencies": {
+      "markdownlint": "0.42.1",
+      "katex": "0.19.1",
+      "re2js": "2.9.1"
+    },
+    "markdown-manifest": "{\n  \"name\": \"project-check-tools\",\n  \"private\": true,\n  \"dependencies\": {\n    \"markdownlint-cli2\": \"0.24.0\"\n  },\n  \"overrides\": {\n    \"markdownlint-cli2@0.24.0\": {\n      \"markdownlint\": \"0.42.1\",\n      \"katex\": \"0.19.1\"\n    }\n  }\n}\n",
+    "markdown-lock-sha256": "14336282005d44df6cb54ea0f660b416cecad4a8c5926ca93d79f3ff9e241e09",
+    "ci": {
+      "test.yml": {
+        "test": {
+          "name": "Test",
+          "runs-on": "ubuntu-latest",
+          "timeout-minutes": 15,
+          "steps": [
+            {
+              "name": "Checkout code",
+              "uses": "actions/checkout@v7.0.1",
+              "with": {
+                "persist-credentials": false
+              }
+            },
+            {
+              "name": "Set up Docker",
+              "uses": "docker/setup-docker-action@v5.7.0",
+              "with": {
+                "version": "v29.9.3"
+              }
+            },
+            {
+              "name": "Run test",
+              "shell": "bash",
+              "run": "set -euo pipefail\nsource tests/container/stock\nstock_begin \"$PWD\"\nstock_image python_image \"__PYTHON_IMAGE__\"\nstock_prepare \"${python_image}\" python -- sh -ec '\n  python -m venv /scratch/venv >&2\n  /scratch/venv/bin/python -m pip install --disable-pip-version-check -r requirements-dev.txt >&2\n  tar --create --file - --directory / scratch/venv\n'\nstock_run \"${python_image}\" python -- /scratch/venv/bin/python -m pytest -v -p no:cacheprovider --basetemp=/scratch/pytest\nstock_finish\n"
+            }
+          ]
+        },
+        "lint": {
+          "name": "Lint",
+          "runs-on": "ubuntu-latest",
+          "timeout-minutes": 15,
+          "steps": [
+            {
+              "name": "Checkout code",
+              "uses": "actions/checkout@v7.0.1",
+              "with": {
+                "persist-credentials": false
+              }
+            },
+            {
+              "name": "Set up Docker",
+              "uses": "docker/setup-docker-action@v5.7.0",
+              "with": {
+                "version": "v29.9.3"
+              }
+            },
+            {
+              "name": "Run lint",
+              "shell": "bash",
+              "run": "set -euo pipefail\nsource tests/container/stock\nstock_begin \"$PWD\"\nstock_image python_image \"__PYTHON_IMAGE__\"\nstock_prepare \"${python_image}\" python -- sh -ec '\n  python -m venv /scratch/venv >&2\n  /scratch/venv/bin/python -m pip install --disable-pip-version-check -r requirements-dev.txt >&2\n  tar --create --file - --directory / scratch/venv\n'\nstock_run \"${python_image}\" python -- sh -ec '\n  bash -n configs/container/run tests/container/stock tests/container/check-stock\n  sh -n tests/container/python tests/container/markdown\n  /scratch/venv/bin/ruff check .\n  /scratch/venv/bin/ruff format --check .\n'\nstock_image markdown_image __MARKDOWN_IMAGE__\nstock_prepare \"${markdown_image}\" markdown -- sh -ec '\n  mkdir -p /scratch/markdown\n  cp tests/container/package.json tests/container/package-lock.json /scratch/markdown/\n  npm ci --prefix /scratch/markdown --ignore-scripts --no-audit --no-fund --maxsockets=1 >&2\n  tar --create --file - --directory / scratch/markdown\n'\nstock_run \"${markdown_image}\" markdown -- /scratch/markdown/node_modules/.bin/markdownlint-cli2\nstock_image shellcheck_image __SHELLCHECK_IMAGE__\nstock_readonly \"${shellcheck_image}\" /bin/shellcheck -x -P SCRIPTDIR \\\n  configs/container/run tests/container/stock tests/container/check-stock tests/container/python tests/container/markdown\nstock_finish\n"
+            }
+          ]
+        }
+      },
+      "release.yml": {
+        "build": {
+          "name": "Build",
+          "runs-on": "ubuntu-latest",
+          "timeout-minutes": 15,
+          "steps": [
+            {
+              "name": "Checkout code",
+              "uses": "actions/checkout@v7.0.1",
+              "with": {
+                "persist-credentials": false
+              }
+            },
+            {
+              "name": "Set up Docker",
+              "uses": "docker/setup-docker-action@v5.7.0",
+              "with": {
+                "version": "v29.9.3"
+              }
+            },
+            {
+              "name": "Pack the sweep and its canon",
+              "shell": "bash",
+              "run": "set -euo pipefail\nsource tests/container/stock\nstock_begin \"$PWD\"\nstock_image python_image \"__PYTHON_IMAGE__\"\noutputs=(dist)\nstock_run \"${python_image}\" '' -- sh -ec '\n  python -m py_compile check-drift.py test_check_drift.py\n  mkdir -p dist\n  tar --create --gzip --file dist/github-config-drift.tar.gz check-drift.py configs\n'\nstock_finish\n"
+            },
+            {
+              "name": "Upload build artifact",
+              "uses": "actions/upload-artifact@v7.0.2",
+              "with": {
+                "name": "github-config-drift",
+                "path": "dist/github-config-drift.tar.gz"
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

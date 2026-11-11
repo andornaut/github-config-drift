@@ -11,6 +11,7 @@ import json
 import sys
 import tomllib
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 import yaml
@@ -3334,3 +3335,359 @@ class TestNativeNodeProfiles:
         files["-"] = "#!/bin/sh\nexit 0\n"
         with pytest.raises(ValueError, match="ShellCheck options"):
             cd.native_node_steps([command], files)
+
+
+class TestStockSource:
+    MAKE = """.DEFAULT_GOAL := check
+PYTHON_IMAGE := python:$(shell cat .python-version)
+MARKDOWN_IMAGE := node:24.22.2
+SHELLCHECK_IMAGE := koalaman/shellcheck:v0.11.0
+export PYTHON_IMAGE MARKDOWN_IMAGE SHELLCHECK_IMAGE
+export CHECK_TIMEOUT_SECONDS CHECK_MEMORY CHECK_SCRATCH_SIZE CHECK_WORK_SIZE CHECK_TMP_SIZE
+.PHONY: check lint test build
+check lint test build:
+\t@./tests/container/check-stock $@
+"""
+
+    @staticmethod
+    def fixture(monkeypatch, tmp_path):
+        profile = json.loads((cd.CANON / "container" / "stock-profiles.json").read_text())["python-sweep"]
+        # This fixture isolates metadata verification; the runtime owns library behavior tests.
+        library = "#!/usr/bin/env bash\n# Canonical library fixture.\n"
+        canon = tmp_path / "configs"
+        (canon / "container").mkdir(parents=True)
+        (canon / "shell").mkdir()
+        for name in ("stock-profiles.json", "tools.json"):
+            (canon / "container" / name).write_text((cd.CANON / "container" / name).read_text())
+        (canon / "container" / "stock").write_text(library)
+        (canon / "shell" / "shellcheck-step.yml").write_text((cd.CANON / "shell" / "shellcheck-step.yml").read_text())
+        for directory, filename in (("markdown", "markdownlint-cli2.yaml"), ("attributions", "ai-attributions.yml")):
+            (canon / directory).mkdir()
+            (canon / directory / filename).write_text((cd.CANON / directory / filename).read_text())
+        # The actual locked graph is independent of the helper-reference JSON.
+        lock = (Path(__file__).parent / "tests/container/package-lock.json").read_text()
+        files = {
+            **profile["helpers"],
+            "tests/container/stock": library,
+            "Makefile": TestStockSource.MAKE,
+            ".python-version": "3.12\n",
+            "requirements-dev.txt": profile["requirements"],
+            "tests/container/package.json": profile["markdown-manifest"],
+            "tests/container/package-lock.json": lock,
+        }
+        monkeypatch.setattr(cd, "CANON", canon)
+        return profile, files
+
+    @staticmethod
+    def install(monkeypatch, files, modes=None):
+        modes = modes or {}
+        tree = {"truncated": False, "tree": []}
+        blobs = {}
+        for path, text in files.items():
+            raw = text.encode()
+            sha = hashlib.sha1(b"blob " + str(len(raw)).encode() + b"\0" + raw, usedforsecurity=False).hexdigest()
+            mode = "100755" if path.startswith("tests/container/") and not path.endswith(".json") else "100644"
+            tree["tree"].append({"path": path, "type": "blob", "mode": modes.get(path, mode), "sha": sha})
+            blobs[sha] = raw
+        calls = TestFrozenHarness.install(monkeypatch, tree, blobs)
+        monkeypatch.setattr(
+            cd, "fetch", lambda repo, path: base64.b64encode(files[path].encode()).decode() if path in files else None
+        )
+        return calls
+
+    def test_an_inspected_profile_proves_immutable_sources_and_shared_image_pins(self, monkeypatch, tmp_path):
+        profile, files = self.fixture(monkeypatch, tmp_path)
+        calls = self.install(monkeypatch, files)
+        actual, verified, images = cd.stock_source("demo")
+        assert actual == profile
+        assert verified == files
+        assert images == {
+            "PYTHON_IMAGE": "python:3.12",
+            "MARKDOWN_IMAGE": "node:24.22.2",
+            "SHELLCHECK_IMAGE": "koalaman/shellcheck:v0.11.0",
+        }
+        assert calls[0] == "repos/andornaut/demo/git/trees/HEAD?recursive=1"
+        assert len(calls) == len(files) + 1
+
+    @pytest.mark.parametrize("path", ["tests/container/stock", "tests/container/python", "tests/container/markdown"])
+    def test_modified_inspected_helpers_cannot_claim_stock_coverage(self, monkeypatch, tmp_path, path):
+        _, files = self.fixture(monkeypatch, tmp_path)
+        files[path] += "\nexit 0\n"
+        self.install(monkeypatch, files)
+        with pytest.raises(ValueError, match="metadata differs"):
+            cd.stock_source("demo")
+
+    @pytest.mark.parametrize(
+        "path", ["tests/container/check-stock", "tests/container/stock", "Makefile", ".python-version"]
+    )
+    def test_sources_must_retain_regular_git_modes(self, monkeypatch, tmp_path, path):
+        _, files = self.fixture(monkeypatch, tmp_path)
+        self.install(monkeypatch, files, {path: "120000"})
+        with pytest.raises(ValueError, match=r"metadata differs|regular Git file"):
+            cd.stock_source("demo")
+
+    @pytest.mark.parametrize(
+        ("before", "after"),
+        [
+            ("PYTHON_IMAGE := python:$(shell cat .python-version)", "PYTHON_IMAGE := python:latest"),
+            ("SHELLCHECK_IMAGE := koalaman/shellcheck:v0.11.0", "SHELLCHECK_IMAGE := koalaman/shellcheck:latest"),
+            ("MARKDOWN_IMAGE := node:24.22.2", "MARKDOWN_IMAGE := node:latest"),
+            ("@./tests/container/check-stock $@", "@./tests/container/check-stock $@ || true"),
+            ("check lint test build:", "check: lint\nlint test build:"),
+            ("PYTHON_IMAGE :=", "PYTHON_IMAGE ?="),
+            (
+                "export PYTHON_IMAGE MARKDOWN_IMAGE SHELLCHECK_IMAGE",
+                "export PYTHON_IMAGE MARKDOWN_IMAGE SHELLCHECK_IMAGE PATH",
+            ),
+        ],
+    )
+    def test_make_cannot_change_image_selection_or_mask_the_gate(self, monkeypatch, tmp_path, before, after):
+        _, files = self.fixture(monkeypatch, tmp_path)
+        files["Makefile"] = files["Makefile"].replace(before, after)
+        self.install(monkeypatch, files)
+        with pytest.raises(ValueError, match=r"stock|Make"):
+            cd.stock_source("demo")
+
+    def test_optional_category_aliases_and_metadata_are_not_required(self, monkeypatch, tmp_path):
+        _, files = self.fixture(monkeypatch, tmp_path)
+        files["Makefile"] = files["Makefile"].replace("check lint test build", "check")
+        self.install(monkeypatch, files)
+        assert cd.stock_source("demo")[2]["PYTHON_IMAGE"] == "python:3.12"
+
+    @pytest.mark.parametrize(
+        "path", ["requirements-dev.txt", "tests/container/package.json", "tests/container/package-lock.json"]
+    )
+    def test_dependencies_must_match_the_inspected_frozen_inputs(self, monkeypatch, tmp_path, path):
+        _, files = self.fixture(monkeypatch, tmp_path)
+        files[path] += "\n"
+        self.install(monkeypatch, files)
+        with pytest.raises(ValueError, match=r"frozen|manifest"):
+            cd.stock_source("demo")
+
+    def test_runtime_versions_are_shared_numeric_references(self, monkeypatch, tmp_path):
+        _, files = self.fixture(monkeypatch, tmp_path)
+        files[".python-version"] = "latest\n"
+        self.install(monkeypatch, files)
+        with pytest.raises(ValueError, match="numeric runtime"):
+            cd.stock_source("demo")
+
+    def test_canonical_tool_upgrades_invalidate_stale_stock_pins(self, monkeypatch, tmp_path):
+        _, files = self.fixture(monkeypatch, tmp_path)
+        self.install(monkeypatch, files)
+        path = cd.CANON / "container" / "tools.json"
+        path.write_text(json.dumps({"markdownlint-cli2": "99.0.0"}))
+        with pytest.raises(ValueError, match="canonical pins"):
+            cd.stock_source("demo")
+
+    def test_a_stock_make_workflow_is_reported_without_fetching_a_dockerfile(self, monkeypatch, tmp_path):
+        _, files = self.fixture(monkeypatch, tmp_path)
+        self.install(monkeypatch, files)
+        found, carried = cd.make_findings({"check"}, "demo")
+        assert found == [("Stock checks", "stock-image CI must run native commands without Make")]
+        assert carried == {"action-shellcheck", "markdownlint-cli2-action"}
+
+    @pytest.mark.parametrize("role", ["PYTHON_IMAGE", "MARKDOWN_IMAGE", "SHELLCHECK_IMAGE"])
+    @pytest.mark.parametrize(
+        "assignment",
+        [
+            "{role} = arbitrary:latest",
+            "{role} ?= arbitrary:latest",
+            "{role} += suffix",
+            "override {role} := arbitrary:latest",
+            "export {role} = arbitrary:latest",
+            "check: {role} = arbitrary:latest",
+        ],
+    )
+    def test_no_later_assignment_form_can_override_a_verified_stock_image(
+        self, monkeypatch, tmp_path, role, assignment
+    ):
+        _, files = self.fixture(monkeypatch, tmp_path)
+        files["Makefile"] += assignment.format(role=role) + "\n"
+        self.install(monkeypatch, files)
+        with pytest.raises(ValueError, match=r"stock|Make"):
+            cd.stock_source("demo")
+
+
+class TestStockCi:
+    IMAGES: ClassVar[dict] = {
+        "PYTHON_IMAGE": "python:3.12",
+        "MARKDOWN_IMAGE": "node:24.22.2",
+        "SHELLCHECK_IMAGE": "koalaman/shellcheck:v0.11.0",
+    }
+    REFERENCE: ClassVar[dict] = {
+        "native.yml": {
+            "test": {
+                "runs-on": "ubuntu-latest",
+                "container": "__PYTHON_IMAGE__",
+                "timeout-minutes": 15,
+                "steps": [
+                    {"run": "python -m pip install --disable-pip-version-check -r requirements-dev.txt"},
+                    {"run": "python -m pytest"},
+                ],
+            },
+            "markdown": {
+                "runs-on": "ubuntu-latest",
+                "container": "__MARKDOWN_IMAGE__",
+                "timeout-minutes": 15,
+                "steps": [
+                    {"run": "npm ci --prefix tests/container --ignore-scripts --no-audit --no-fund --maxsockets=1"},
+                    {"run": "tests/container/node_modules/.bin/markdownlint-cli2"},
+                ],
+            },
+            "shell": {
+                "runs-on": "ubuntu-latest",
+                "container": "__SHELLCHECK_IMAGE__",
+                "timeout-minutes": 15,
+                "steps": [{"run": "shellcheck tests/container/stock tests/container/check-stock"}],
+            },
+        },
+    }
+    WORKFLOW = """name: Native checks
+"on": push
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container: python:3.12
+    timeout-minutes: 15
+    steps:
+      - run: python -m pip install --disable-pip-version-check -r requirements-dev.txt
+      - run: python -m pytest
+  markdown:
+    runs-on: ubuntu-latest
+    container: node:24.22.2
+    timeout-minutes: 15
+    steps:
+      - run: npm ci --prefix tests/container --ignore-scripts --no-audit --no-fund --maxsockets=1
+      - run: tests/container/node_modules/.bin/markdownlint-cli2
+  shell:
+    runs-on: ubuntu-latest
+    container: koalaman/shellcheck:v0.11.0
+    timeout-minutes: 15
+    steps:
+      - run: shellcheck tests/container/stock tests/container/check-stock
+"""
+
+    def test_exact_native_jobs_bind_all_verified_stock_image_roles(self):
+        assert cd.stock_ci_jobs({"ci": self.REFERENCE}, self.IMAGES, {"native.yml": self.WORKFLOW}) == []
+
+    @pytest.mark.parametrize(
+        ("path", "value"),
+        [
+            (("jobs", "test", "container"), "python:latest"),
+            (("jobs", "test", "continue-on-error"), True),
+            (("jobs", "test", "if"), "false"),
+            (("jobs", "test", "env"), {"PATH": "/tmp/fake"}),
+            (("jobs", "test", "steps", 0, "run"), "python -m pip install pytest"),
+            (("jobs", "test", "steps", 1, "run"), "python -m pytest || true"),
+            (("jobs", "test", "steps", 1, "if"), "false"),
+            (("jobs", "markdown", "steps", 0, "run"), "npm install --prefix tests/container"),
+            (("jobs", "shell", "steps", 0, "run"), "shellcheck --version"),
+            (("jobs", "shell", "timeout-minutes"), 15.0),
+            (("env",), {"PYTHONPATH": "/tmp/fake"}),
+            (("defaults",), {"run": {"working-directory": "/tmp"}}),
+            (("permissions",), {"contents": "write"}),
+        ],
+    )
+    def test_native_ci_cannot_change_the_source_image_bootstrap_or_failure_result(self, path, value):
+        document = cd.workflow_document(self.WORKFLOW)
+        node = document
+        for key in path[:-1]:
+            node = node[key]
+        node[path[-1]] = value
+        actual = yaml.safe_dump(document, sort_keys=False)
+        assert cd.stock_ci_jobs({"ci": self.REFERENCE}, self.IMAGES, {"native.yml": actual})
+
+    def test_missing_native_jobs_do_not_receive_coverage(self):
+        document = cd.workflow_document(self.WORKFLOW)
+        del document["jobs"]["markdown"]
+        assert cd.stock_ci_jobs({"ci": self.REFERENCE}, self.IMAGES, {"native.yml": yaml.safe_dump(document)})
+
+    def test_literal_ci_image_copies_cannot_replace_shared_role_bindings(self):
+        reference = json.loads(json.dumps(self.REFERENCE).replace("__PYTHON_IMAGE__", "python:3.12"))
+        with pytest.raises(ValueError, match="bind every verified image"):
+            cd.stock_ci_jobs({"ci": reference}, self.IMAGES, {"native.yml": self.WORKFLOW})
+
+    def test_native_ci_is_compared_to_immutable_workflow_blobs(self, monkeypatch, tmp_path):
+        profile, files = TestStockSource.fixture(monkeypatch, tmp_path)
+        profile["ci"] = self.REFERENCE
+        (cd.CANON / "container" / "stock-profiles.json").write_text(json.dumps({"python-sweep": profile}))
+        files[".github/workflows/native.yml"] = self.WORKFLOW
+        TestStockSource.install(monkeypatch, files)
+        findings, carried = cd.stock_findings("demo", {"native.yml": self.WORKFLOW})
+        assert findings == []
+        assert carried == {"action-shellcheck", "markdownlint-cli2-action"}
+        changed = self.WORKFLOW.replace("name: Native checks", "name: Changed checks")
+        findings, carried = cd.stock_findings("demo", {"native.yml": changed})
+        assert not carried
+        assert findings == [("Stock checks", "stock CI source changed during its immutable proof")]
+
+    def test_legacy_workflows_do_not_fetch_stock_sources(self, monkeypatch):
+        def unexpected(*args, **kwargs):
+            raise AssertionError("legacy workflows must not fetch stock sources")
+
+        monkeypatch.setattr(cd, "stock_source", unexpected)
+        assert cd.stock_findings("demo", {"test.yml": SOUND}) == ([], set())
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("jobs: []", False),
+            ("jobs: malformed", False),
+            (WORKFLOW, True),
+            ("jobs:\n  check:\n    steps:\n      - run: source tests/container/stock\n", True),
+            ("jobs:\n  check:\n    steps:\n      - run: docker run python:3.12 python -m pytest\n", True),
+        ],
+    )
+    def test_only_stock_execution_shapes_trigger_the_new_proof(self, text, expected):
+        assert cd.stock_workflow_hint(text) is expected
+
+    def test_check_credits_stock_native_jobs_without_changing_legacy_fetch_order(self, monkeypatch, tmp_path):
+        profile, files = TestStockSource.fixture(monkeypatch, tmp_path)
+        profile["ci"] = self.REFERENCE
+        (cd.CANON / "container" / "stock-profiles.json").write_text(json.dumps({"python-sweep": profile}))
+        workflow = self.WORKFLOW.replace(
+            "name: Native checks",
+            "# Capped well under the six-hour default: checks finish quickly.\n"
+            "# A check still going at fifteen has hung rather than failed.\nname: Native checks",
+        )
+        files[".github/workflows/native.yml"] = workflow
+        source_calls = TestStockSource.install(monkeypatch, files)
+        files[".markdownlint-cli2.yaml"] = (
+            Path(__file__).parent / "configs/markdown/markdownlint-cli2.yaml"
+        ).read_text()
+        files[".github/workflows/ai-attributions.yml"] = (
+            Path(__file__).parent / "configs/attributions/ai-attributions.yml"
+        ).read_text()
+        findings, calls = TestCheck.run(monkeypatch, files, workflows=("native.yml",))
+        assert findings == []
+        assert calls.index("Makefile") > calls.index("workflows/")
+        assert "languages/Shell" not in calls
+        assert source_calls[0].endswith("/git/trees/HEAD?recursive=1")
+
+    def test_profile_reference_keeps_all_native_gate_phases(self):
+        profile = json.loads((cd.CANON / "container/stock-profiles.json").read_text())["python-sweep"]
+        assert set(profile["ci"]) == {"test.yml", "release.yml"}
+        assert set(profile["ci"]["test.yml"]) == {"test", "lint"}
+        assert set(profile["ci"]["release.yml"]) == {"build"}
+        body = "\n".join(
+            step.get("run", "") for jobs in profile["ci"].values() for job in jobs.values() for step in job["steps"]
+        )
+        for command in (
+            "python -m pip install --disable-pip-version-check -r requirements-dev.txt",
+            "python -m pytest -v -p no:cacheprovider --basetemp=/scratch/pytest",
+            "ruff check .",
+            "ruff format --check .",
+            "markdownlint-cli2",
+            "/bin/shellcheck -x -P SCRIPTDIR",
+            "py_compile check-drift.py test_check_drift.py",
+            "tar --create --gzip --file dist/github-config-drift.tar.gz check-drift.py configs",
+        ):
+            assert command in body
+        assert "docker build" not in body
+        assert "make check" not in body
+
+    def test_changed_library_sources_and_masked_private_calls_still_trigger_proof(self):
+        text = "jobs:\n  test:\n    steps:\n      - run: source other-library; stock_run image lane -- true || true\n"
+        assert cd.stock_workflow_hint(text)

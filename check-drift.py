@@ -1680,6 +1680,199 @@ def container_manifests(text):
     return tuple(prefix + name for name in ("package.json", "package-lock.json"))
 
 
+def stock_makefile(profile, files):
+    """Prove the private stock route without adding public Make metadata."""
+    text = files["Makefile"]
+    images = profile["images"]
+    if set(images) != {"PYTHON_IMAGE", "MARKDOWN_IMAGE", "SHELLCHECK_IMAGE"}:
+        raise ValueError("stock profile must declare its three inspected image roles")
+    for name, expected in images.items():
+        declarations = list(re.finditer(rf"^{name}[ \t]*:=[ \t]*(.*)$", text, re.MULTILINE))
+        if len(declarations) != 1 or declarations[0][1].strip() != expected:
+            raise ValueError(f"stock Make must retain its single pinned {name} declaration")
+        text = text[: declarations[0].start()] + text[declarations[0].end() :]
+    export = "export PYTHON_IMAGE MARKDOWN_IMAGE SHELLCHECK_IMAGE"
+    if text.splitlines().count(export) != 1:
+        raise ValueError("stock Make must export only the declared image roles")
+    text = text.replace(export, "")
+    operative = "\n".join(line.split("#", 1)[0] for line in text.splitlines())
+    if any(re.search(rf"\b{name}\b", operative) for name in images):
+        raise ValueError("stock image roles must appear only in their inspected declarations and export")
+    text = text.replace("@./tests/container/check-stock $@", "@./tests/container/run $@")
+    _, recipes = make_tasks("CHECK_TASKS := lint test build\nexport CHECK_TASKS\n" + text)
+    if recipes.get("check") != ["@./tests/container/run $@"]:
+        raise ValueError("stock Make check must dispatch directly to its inspected project helper")
+    version = files[profile["version-file"]].strip()
+    if re.fullmatch(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?", version) is None:
+        raise ValueError("stock Python version must be a literal numeric runtime")
+    if images["PYTHON_IMAGE"] != "python:$(shell cat .python-version)":
+        raise ValueError("stock Python image must derive from its shared version file")
+    shell_pin = yaml.safe_load((CANON / "shell" / "shellcheck-step.yml").read_text())[0]["with"]["version"]
+    if images["SHELLCHECK_IMAGE"] != f"koalaman/shellcheck:{shell_pin}":
+        raise ValueError("stock ShellCheck image must follow the canonical tool pin")
+    return {**images, "PYTHON_IMAGE": "python:" + version}
+
+
+def stock_source(repo, makefile=None, workflows=None):
+    """Verify exact library/profile blobs and frozen dependencies before coverage."""
+    if makefile is None:
+        content = fetch(repo, "Makefile")
+        if content is None:
+            raise ValueError("stock checks need Makefile")
+        makefile = decode(content)
+    content = fetch(repo, "tests/container/check-stock")
+    if content is None:
+        raise ValueError("stock checks need tests/container/check-stock")
+    helper = decode(content)
+    profiles = json.loads((CANON / "container" / "stock-profiles.json").read_text())
+    selected = [profile for profile in profiles.values() if profile["helpers"]["tests/container/check-stock"] == helper]
+    if len(selected) != 1:
+        raise ValueError("stock project helper differs from the inspected source profiles")
+    profile = selected[0]
+    expected_paths = {"tests/container/check-stock", "tests/container/python", "tests/container/markdown"}
+    if set(profile["helpers"]) != expected_paths or profile["version-file"] != ".python-version":
+        raise ValueError("stock profile has unsupported source or runtime roles")
+    library = CANON / "container" / "stock"
+    if not library.is_file():
+        raise ValueError("canonical stock library is missing")
+    approved = {"tests/container/stock": library.read_text(), **profile["helpers"]}
+    reference = {
+        "files": {
+            path: {
+                "mode": "100755",
+                "blob": hashlib.sha1(
+                    b"blob " + str(len(text.encode())).encode() + b"\0" + text.encode(), usedforsecurity=False
+                ).hexdigest(),
+                "sha256": hashlib.sha256(text.encode()).hexdigest(),
+                "content": text,
+            }
+            for path, text in approved.items()
+        }
+    }
+    regular = dict.fromkeys(
+        (
+            "Makefile",
+            ".python-version",
+            "requirements-dev.txt",
+            "tests/container/package.json",
+            "tests/container/package-lock.json",
+        ),
+        "100644",
+    )
+    if workflows is not None:
+        ci = profile.get("ci")
+        if not isinstance(ci, dict) or not ci:
+            raise ValueError("stock profile needs inspected native CI jobs")
+        regular.update({".github/workflows/" + name: "100644" for name in ci})
+    files = {path: raw.decode() for path, raw in reference_files("stock checks", regular, reference, repo).items()}
+    if workflows is not None and any(
+        files[".github/workflows/" + name] != workflows.get(name) for name in profile["ci"]
+    ):
+        raise ValueError("stock CI source changed during its immutable proof")
+    if files["Makefile"] != makefile:
+        raise ValueError("stock Make source changed during its immutable proof")
+    images = stock_makefile(profile, files)
+    if files["requirements-dev.txt"] != profile["requirements"]:
+        raise ValueError("stock Python preparation must install its inspected frozen requirements")
+    if (
+        files["tests/container/package.json"] != profile["markdown-manifest"]
+        or hashlib.sha256(files["tests/container/package-lock.json"].encode()).hexdigest()
+        != profile["markdown-lock-sha256"]
+    ):
+        raise ValueError("stock Markdown preparation must use its inspected manifest and frozen lock")
+    manifest = json.loads(files["tests/container/package.json"])
+    lock = json.loads(files["tests/container/package-lock.json"])
+    version = json.loads((CANON / "container" / "tools.json").read_text())["markdownlint-cli2"]
+    security = profile["markdown-dependencies"]
+    if (
+        manifest.get("dependencies") != {"markdownlint-cli2": version}
+        or manifest.get("overrides")
+        != {f"markdownlint-cli2@{version}": {k: security[k] for k in ("markdownlint", "katex")}}
+        or lock.get("packages", {}).get("", {}).get("dependencies") != manifest["dependencies"]
+        or any(
+            lock.get("packages", {}).get("node_modules/" + tool, {}).get("version") != pin
+            for tool, pin in {"markdownlint-cli2": version, **security}.items()
+        )
+    ):
+        raise ValueError("stock Markdown tools must retain canonical pins and their patched dependency chain")
+    return profile, files, images
+
+
+def stock_workflow_hint(text):
+    """Fetch stock sources only for workflows selecting literal stock images."""
+    try:
+        document = workflow_document(text)
+    except (ValueError, yaml.YAMLError):
+        return False
+    jobs = document.get("jobs") or {}
+    if not isinstance(jobs, dict):
+        return False
+    for job in jobs.values():
+        if not isinstance(job, dict):
+            continue
+        container = job.get("container")
+        image = container.get("image") if isinstance(container, dict) else container
+        if isinstance(image, str) and re.match(r"(?:python|node|koalaman/shellcheck):", image):
+            return True
+        for step in job.get("steps") or []:
+            command = step.get("run", "") if isinstance(step, dict) else ""
+            if isinstance(command, str) and (
+                "tests/container/stock" in command
+                or re.search(r"\bstock_(?:begin|image|prepare|run|readonly|finish)\b", command)
+            ):
+                return True
+            if (
+                isinstance(command, str)
+                and re.search(r"\bdocker\s+run\b", command)
+                and any(prefix in command for prefix in ("python:", "node:", "koalaman/shellcheck:"))
+            ):
+                return True
+    return False
+
+
+def stock_ci_jobs(profile, images, workflows):
+    """Recognize complete inspected native jobs, never arbitrary command shapes."""
+    expected_workflows = profile.get("ci")
+    if not isinstance(expected_workflows, dict) or not expected_workflows:
+        raise ValueError("stock profile needs inspected native CI jobs")
+    encoded = json.dumps(expected_workflows)
+    if any("__" + name + "__" not in encoded for name in images):
+        raise ValueError("stock CI reference must bind every verified image role")
+    complaints = []
+    for filename, jobs in expected_workflows.items():
+        if re.fullmatch(r"[\w-]+\.ya?ml", filename) is None or not isinstance(jobs, dict) or not jobs:
+            raise ValueError("stock CI reference must name literal workflow/job records")
+        document = workflow_document(workflows.get(filename, ""))
+        if document.get("permissions") != {"contents": "read"} or document.get("env") or document.get("defaults"):
+            complaints.append(f"{filename} must retain read permissions without workflow overrides")
+        for job_id, expected in jobs.items():
+            # Only verified image values are substituted into the inspected job record.
+            template = json.dumps(expected)
+            for name, image in images.items():
+                template = template.replace("__" + name + "__", image)
+            wanted = json.loads(template)
+            actual = (document.get("jobs") or {}).get(job_id)
+            # CI may read the same version file instead of duplicating its literal pin.
+            actual_text = json.dumps(actual).replace("python:$(cat .python-version)", images["PYTHON_IMAGE"])
+            if not same_workflow_shape(wanted, json.loads(actual_text)):
+                complaints.append(f"{filename}:{job_id} differs from its inspected native image, bootstrap or gate")
+    return complaints
+
+
+def stock_findings(repo, workflows):
+    """Keep stock native CI proof separate from the unchanged custom-image route."""
+    if not any(stock_workflow_hint(text) for text in workflows.values()):
+        return [], set()
+    try:
+        profile, _, images = stock_source(repo, workflows=workflows)
+        complaints = stock_ci_jobs(profile, images, workflows)
+    except (ValueError, TypeError, KeyError, AttributeError, yaml.YAMLError) as error:
+        complaints = [str(error)]
+    if complaints:
+        return [("Stock checks", complaint) for complaint in complaints], set()
+    return [], {"action-shellcheck", "markdownlint-cli2-action"}
+
+
 def make_findings(targets, repo):
     """Fetch a Make contract only after CI selects its literal check categories."""
     if repo == "faramir":
@@ -1700,6 +1893,15 @@ def make_findings(targets, repo):
         if content is None:
             return [("Make checks", f"missing {path}")], set()
         files[path] = decode(content)
+        if path == "Makefile" and re.search(r"(?m)^\t@?\./tests/container/check-stock\b", files[path]):
+            try:
+                stock_source(repo, files[path])
+            except (ValueError, TypeError, KeyError) as error:
+                return [("Stock checks", str(error))], set()
+            return [("Stock checks", "stock-image CI must run native commands without Make")], {
+                "action-shellcheck",
+                "markdownlint-cli2-action",
+            }
     if "npm ci --ignore-scripts --no-audit --no-fund" in files["tests/container/Dockerfile"]:
         try:
             manifests = container_manifests(files["tests/container/Dockerfile"])
@@ -1918,11 +2120,14 @@ def check(repo, uses=None):
     canon_text = (CANON / "attributions" / "ai-attributions.yml").read_text()
     found[attribution_index:attribution_index] = attribution_findings(canon_text, workflows)
 
-    container_stepped = set()
+    stock_rows, container_stepped = stock_findings(repo, workflows)
+    found += stock_rows
     if make_targets:
-        rows, container_stepped = make_findings(make_targets, repo)
+        rows, carried = make_findings(make_targets, repo)
+        container_stepped |= carried
         found += rows
-    found += absent_step_findings(holds, repo, stepped, container_stepped, bool(make_targets))
+    stock_selected = any(stock_workflow_hint(text) for text in workflows.values())
+    found += absent_step_findings(holds, repo, stepped, container_stepped, bool(make_targets) or stock_selected)
 
     return found
 

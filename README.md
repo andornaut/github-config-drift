@@ -139,8 +139,9 @@ isolation, image identity and ownership. Native commands run directly on the hos
 CI uses native commands in a suitable prebuilt image, or Make when a custom image
 is required.
 
-Checks require Make and Docker 29.9.3, matching CI. Only a sanitized source snapshot
-and scratch storage are mounted during verification.
+Checks require Make, Bash, Git, tar/coreutils, Docker 29.9.3 and host Python 3 for
+archive-header validation. Project checks run in pinned stock images; only a
+sanitized source snapshot and scratch storage are mounted.
 
 ```bash
 make check

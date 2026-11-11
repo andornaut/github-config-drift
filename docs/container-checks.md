@@ -34,20 +34,24 @@ reference or enforced by a checked invariant. Reuse a suitable prebuilt image
 rather than adding a custom image build. A project needing a custom image owns its
 Dockerfile, explicit context manifest, build arguments and runtime version inputs.
 Execute the image ID returned by its builder; do not add an independent CI image
-pin or require a registry.
+pin or require a registry. The stock launcher resolves cached or pulled image
+references to immutable IDs. Frozen dependency archives are restored only with
+the same image ID; networked preparation is separate from offline checks.
 
 Custom-image CI may use optional category aliases to preserve separate jobs and
 status-check names. A private launcher, command
 adapter or output interface is project-owned, not an additional standard API.
 Docker orchestration runs on the host virtual machine, not inside a check
-container.
+container. CI may reuse private provenance/isolation functions with literal native
+commands; stock CI does not dispatch project phases or Make.
 
 ## Isolation, outputs and resources
 
 Custom image launchers restrict build context to declared regular files. Source
 archives use containment and exclusion checks. Git metadata and credential-shaped
 paths are excluded. Source status, revision and file/archive fingerprints must stay
-unchanged throughout verification; discard results if they change.
+unchanged throughout verification; discard results if they change. The stock
+library validates archive headers and logical sizes before host extraction.
 
 Only explicitly declared generated paths may be exported by a project interface.
 Outputs must be ignored content inside the checkout, without tracked
@@ -91,7 +95,8 @@ version or hash inventory in prose:
 
 | Reference | Purpose |
 | --- | --- |
-| [run](../configs/container/run) | Canonical host launcher. |
+| [stock](../configs/container/stock) and [run](../configs/container/run) | Stock-image library and custom-image host launcher. |
+| [stock-profiles.json](../configs/container/stock-profiles.json) | Inspected stock helpers, frozen inputs, image bindings and native CI jobs. |
 | [check-profiles.json](../configs/container/check-profiles.json) | Inspected dispatchers, Dockerfiles and bridges. |
 | [admissions.json](../configs/container/admissions.json) | Reviewed resource-only admission sources. |
 | [harnesses.json](../configs/container/harnesses.json) | Reviewed custom harness and dependency proofs. |
