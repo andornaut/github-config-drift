@@ -1488,7 +1488,7 @@ def source_api(label, endpoint):
     return response
 
 
-def reference_files(label, regular, reference, repo):
+def reference_files(label, regular, reference, repo, *, tree=None):
     """Check every file's Git metadata before reading any immutable blob bytes."""
     approved = reference.get("files")
     if not isinstance(approved, dict) or not approved or set(approved).intersection(regular):
@@ -1502,7 +1502,8 @@ def reference_files(label, regular, reference, repo):
             raise ValueError(f"{label} reference is incomplete")
         if hashlib.sha256(expected["content"].encode()).hexdigest() != expected["sha256"]:
             raise ValueError(f"{label} reference bytes do not match their digest")
-    tree = source_api(label, f"repos/andornaut/{repo}/git/trees/HEAD?recursive=1")
+    if tree is None:
+        tree = source_api(label, f"repos/andornaut/{repo}/git/trees/HEAD?recursive=1")
     if tree.get("truncated") is not False or not isinstance(tree.get("tree"), list):
         raise GhError(f"{label} requires a complete nontruncated Git tree")
     entries = {}
@@ -1680,6 +1681,163 @@ def container_manifests(text):
     return tuple(prefix + name for name in ("package.json", "package-lock.json"))
 
 
+def closed_stock_profile(repo):
+    """Select only an explicitly registered repository's inspected source closure."""
+    path = CANON / "container" / "closed-stock-profiles.json"
+    if not path.is_file():
+        return None
+    catalog = json.loads(path.read_text())
+    profile = catalog["repositories"].get(repo)
+    if profile is None:
+        return None
+    return catalog, profile
+
+
+def closed_stock_source(repo, makefile=None, workflows=None):
+    """Prove complete frozen control/input/CI bytes, without interpreting opaque code."""
+    selected = closed_stock_profile(repo)
+    if selected is None:
+        return None
+    catalog, profile = selected
+    if profile.get("repository") != repo:
+        raise ValueError("closed stock profile identity differs from its repository")
+    expected = {}
+    for name, declared in profile["files"].items():
+        record = declared
+        if record.get("canonical"):
+            kind = record["canonical"]
+            if (kind, name) not in (("stock", "tests/container/stock"), ("run", "tests/container/run")):
+                raise ValueError("closed stock profile has an invalid canonical source binding")
+            content = (CANON / "container" / kind).read_text()
+            if hashlib.sha256(content.encode()).hexdigest() != catalog["canonical_sha256"][kind]:
+                raise ValueError("closed stock profile needs the reviewed canonical source pin")
+            record = {
+                "mode": "100755",
+                "sha256": hashlib.sha256(content.encode()).hexdigest(),
+                "blob": hashlib.sha1(
+                    b"blob " + str(len(content.encode())).encode() + b"\0" + content.encode(), usedforsecurity=False
+                ).hexdigest(),
+            }
+        else:
+            content = catalog["blobs"][record["sha256"]]
+        if record["mode"] not in ("100644", "100755"):
+            raise ValueError("closed stock sources must be regular Git files")
+        expected[name] = {**record, "content": content}
+    if not {"Makefile", "tests/container/stock", profile["entrypoint"]} <= set(expected):
+        raise ValueError("closed stock profile omits its Make, library or entrypoint")
+    if expected[profile["entrypoint"]]["mode"] != "100755":
+        raise ValueError("closed stock entrypoint must retain its executable Git mode")
+    if profile.get("custom_jobs") and not {
+        "tests/container/run",
+        "tests/container/check",
+        "tests/container/Dockerfile",
+        "tests/container/context",
+    } <= set(expected):
+        raise ValueError("hybrid stock profile needs its complete reviewed custom source closure")
+
+    def guard(entries):
+        forbidden = profile.get("forbidden_prefixes")
+        controls = profile.get("control_prefixes")
+        if not isinstance(forbidden, list) or not forbidden or not isinstance(controls, list) or not controls:
+            raise ValueError("closed stock profile needs explicit dependency and control path guards")
+        for entry in entries:
+            path = entry["path"]
+            if any(path == prefix or path.startswith(prefix + "/") for prefix in forbidden):
+                raise ValueError(f"closed stock source contains a forbidden dependency/control path: {path}")
+            if path not in expected and any(path.startswith(prefix) for prefix in controls):
+                raise ValueError(f"closed stock source adds an unreviewed tool control: {path}")
+
+    tree = source_api("closed stock checks", f"repos/andornaut/{repo}/git/trees/HEAD?recursive=1")
+    if (
+        tree.get("truncated") is not False
+        or not isinstance(tree.get("tree"), list)
+        or any(not isinstance(entry, dict) or not isinstance(entry.get("path"), str) for entry in tree.get("tree", []))
+    ):
+        raise GhError("closed stock checks require complete valid Git tree metadata")
+    guard(tree["tree"])
+    files = {
+        name: raw.decode()
+        for name, raw in reference_files("closed stock checks", {}, {"files": expected}, repo, tree=tree).items()
+    }
+    if makefile is not None and files["Makefile"] != makefile:
+        raise ValueError("closed stock Make source changed during verification")
+    for filename, jobs in profile["ci_jobs"].items():
+        path = ".github/workflows/" + filename
+        if path not in files or not isinstance(jobs, list) or not jobs:
+            raise ValueError("closed stock profile needs complete native CI job records")
+        if workflows is not None and files[path] != workflows.get(filename):
+            raise ValueError("closed stock CI source changed during verification")
+        document = workflow_document(files[path])
+        if document.get("permissions") != {"contents": "read"} or document.get("defaults") or document.get("env"):
+            raise ValueError("closed stock native workflows cannot override permissions, shell or environment")
+        for job_id in jobs:
+            job = document.get("jobs", {}).get(job_id)
+            if not isinstance(job, dict) or job.get("continue-on-error") or job.get("if") not in (None, "success()"):
+                raise ValueError("closed stock native gates must run unmasked and unconditionally")
+            for step in job.get("steps", []):
+                if step.get("continue-on-error") or step.get("if") not in (None, "success()"):
+                    raise ValueError("closed stock native steps cannot skip or mask their checks")
+                command = str(step.get("run", ""))
+                lines = [
+                    line.strip() for line in command.splitlines() if line.strip() and not line.lstrip().startswith("#")
+                ]
+                for index, line in enumerate(lines):
+                    if line.startswith("stock_begin "):
+                        guards = {
+                            "pair": ['[[ ${revision} == "${GITHUB_SHA:?}" ]]', "[[ ${source_dirty} == false ]]"],
+                            "full-sha-braced": [
+                                (
+                                    "if [[ ! ${GITHUB_SHA:-} =~ ^[0-9a-f]{40}$ "
+                                    '|| ${revision} != "${GITHUB_SHA:-}" || ${source_dirty} != false ]]; then'
+                                ),
+                                "printf '%s\\n' 'CI requires clean source matching a full GITHUB_SHA.' >&2",
+                                "exit 1",
+                                "fi",
+                            ],
+                            "full-sha": [
+                                (
+                                    "if [[ ! ${GITHUB_SHA:-} =~ ^[0-9a-f]{40}$ "
+                                    '|| $revision != "$GITHUB_SHA" || $source_dirty != false ]]; then'
+                                ),
+                                "printf '%s\\n' 'CI requires a clean stock snapshot at the exact full GITHUB_SHA.' >&2",
+                                "exit 1",
+                                "fi",
+                            ],
+                        }
+                        guard = guards[profile.get("ci_guard", "pair")]
+                        if lines[index + 1 : index + 1 + len(guard)] != guard:
+                            raise ValueError("closed stock CI snapshot must match GITHUB_SHA and be clean")
+                if re.search(r"\bmake\s+(?:check|lint)\b", str(step.get("run", ""))) and job_id not in profile.get(
+                    "custom_jobs", {}
+                ).get(filename, []):
+                    raise ValueError("closed stock CI Make calls require a reviewed hybrid source route")
+    shell = yaml.safe_load((CANON / "shell" / "shellcheck-step.yml").read_text())[0]["with"]["version"]
+    if (
+        profile["shellcheck"] != {"image": f"koalaman/shellcheck:{shell}"}
+        or f"koalaman/shellcheck:{shell}" not in profile["images"].values()
+    ):
+        raise ValueError("closed stock ShellCheck pin differs from canon")
+    manifest = json.loads(files[profile["markdown"]["manifest"]])
+    lock = json.loads(files[profile["markdown"]["lock"]])
+    version = json.loads((CANON / "container" / "tools.json").read_text())["markdownlint-cli2"]
+    declarations = {**manifest.get("dependencies", {}), **manifest.get("devDependencies", {})}
+    pins = json.loads((CANON / "container" / "stock-profiles.json").read_text())["python-sweep"][
+        "markdown-dependencies"
+    ]
+    if declarations.get("markdownlint-cli2") != version or any(
+        lock.get("packages", {}).get("node_modules/" + name, {}).get("version") != pin
+        for name, pin in {"markdownlint-cli2": version, **pins}.items()
+    ):
+        raise ValueError("closed stock Markdown inputs must retain canonical patched tool pins")
+    for role, fact in profile["version_facts"].items():
+        actual = files[fact["path"]].strip()
+        if fact.get("strip_v"):
+            actual = actual.removeprefix("v")
+        if profile["images"][role] != fact["prefix"] + actual:
+            raise ValueError("closed stock image role differs from its frozen version fact")
+    return {"kind": "closed", **profile}, files, profile["images"]
+
+
 def stock_makefile(profile, files):
     """Prove the private stock route without adding public Make metadata."""
     text = files["Makefile"]
@@ -1715,6 +1873,9 @@ def stock_makefile(profile, files):
 
 def stock_source(repo, makefile=None, workflows=None):
     """Verify exact library/profile blobs and frozen dependencies before coverage."""
+    closed = closed_stock_source(repo, makefile, workflows)
+    if closed is not None:
+        return closed
     if makefile is None:
         content = fetch(repo, "Makefile")
         if content is None:
@@ -1861,11 +2022,11 @@ def stock_ci_jobs(profile, images, workflows):
 
 def stock_findings(repo, workflows):
     """Keep stock native CI proof separate from the unchanged custom-image route."""
-    if not any(stock_workflow_hint(text) for text in workflows.values()):
+    if closed_stock_profile(repo) is None and not any(stock_workflow_hint(text) for text in workflows.values()):
         return [], set()
     try:
         profile, _, images = stock_source(repo, workflows=workflows)
-        complaints = stock_ci_jobs(profile, images, workflows)
+        complaints = [] if profile.get("kind") == "closed" else stock_ci_jobs(profile, images, workflows)
     except (ValueError, TypeError, KeyError, AttributeError, yaml.YAMLError) as error:
         complaints = [str(error)]
     if complaints:
@@ -2107,12 +2268,13 @@ def check(repo, uses=None):
         rows, carried = workflow_findings(name, text)
         found += rows
         stepped |= carried
-        targets, complaints = make_workflow_targets(text)
-        make_targets |= targets
-        found += [(f"Make checks ({name})", complaint) for complaint in complaints]
-        targets, complaints = harness_workflow_targets(repo, text)
-        make_targets |= targets
-        found += [(f"Make checks ({name})", complaint) for complaint in complaints]
+        if closed_stock_profile(repo) is None:
+            targets, complaints = make_workflow_targets(text)
+            make_targets |= targets
+            found += [(f"Make checks ({name})", complaint) for complaint in complaints]
+            targets, complaints = harness_workflow_targets(repo, text)
+            make_targets |= targets
+            found += [(f"Make checks ({name})", complaint) for complaint in complaints]
         if uses is not None:
             for action, version in actions_used(text):
                 uses.setdefault(action, {}).setdefault(version, []).append(repo)
