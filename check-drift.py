@@ -817,15 +817,23 @@ def native_steps(repo, workflows):
     carried = declared()
     if len(carried) == 2:
         return carried
-    scripts = re.findall(r"\bnpm\s+run\s+([\w:-]+)", text)
-    if scripts:
+    npm_run = re.compile(r"\bnpm\s+run\s+([\w:-]+)")
+    pending = npm_run.findall(text)
+    if pending:
         content = fetch(repo, "package.json")
         if content is not None:
-            manifest = json.loads(decode(content))
-            for name in scripts:
-                command = (manifest.get("scripts") or {}).get(name)
+            scripts = json.loads(decode(content)).get("scripts") or {}
+            seen = set()
+            while pending:
+                name = pending.pop()
+                if name in seen:
+                    continue
+                seen.add(name)
+                command = scripts.get(name)
                 if isinstance(command, str):
-                    text += "\n" + command
+                    commands.append(command)
+                    pending.extend(npm_run.findall(command))
+            text = "\n".join(commands)
             carried = declared()
     container_route = r"tests/container/|\bstock_|\bmake\s+(?:(?:check|lint)(?:\s|$)|\$\{\{\s*matrix\.)"
     if len(carried) == 2 or not re.search(container_route, text):
